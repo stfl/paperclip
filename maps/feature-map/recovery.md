@@ -35,6 +35,9 @@ Agent access: [companion](../agent-access-map/recovery.md).
   hosted provider recovery remains separate acceptance.
   Native finalization deadline failures also retain the exact prepared source
   for the same stop-and-save workflow before Retry admits another executor.
+  New messages and orphan cleanup can register missing preservation automatically
+  for the existing worker. Saved input still waits for verified stop and file
+  persistence, then enters ordinary admission once.
 - `unknown-outcome`: `recovery/unknown-outcome` — uncertain external side effects require inspection and
   an explicit decision, not automatic replay.
 - `user-continuation`: `recovery/user-continuation` — saved user messages after a stop are reconsidered once

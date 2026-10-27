@@ -4,6 +4,7 @@ import { readTaskRetryIntent } from "./task-retry.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
+import { preserveNativeFailedWorkspace } from "./native-runtime/native-failed-workspace-recovery.js";
 import { createHash } from "node:crypto";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { canContinueCancelledRun } from "./run-cancellation.js";
@@ -283,6 +284,10 @@ export async function admitExplicitNativeContinuation(input: {
           run.status === "cancelled" && !coordinator.leaseOwner
             ? "The cancelled run still needs verified cleanup. Your message is saved. Inspect the run and its environment for details."
             : "Waiting for the previous run to finish recovery. Your message will start automatically.");
+    const preserved = hasRequiredWorkspaceRecovery(run.resultJson) ? null
+      : await preserveNativeFailedWorkspace(db, run);
+    if (preserved && hasRequiredWorkspaceRecovery(preserved.resultJson)) return blocked("workspace_repair_required",
+      "Paperclip is recovering saved work before continuing. Your message is saved.");
     const leases = await db.select()
       .from(environmentLeases).where(and(
         eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run.id),
