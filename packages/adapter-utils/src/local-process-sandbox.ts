@@ -29,6 +29,13 @@ export interface LocalProcessSandboxOptions {
   networkAllowlist?: string[];
   networkTrustedUrls?: string[];
   command?: string;
+  /** Company and agent of the run; select the host's per-company and per-agent sandbox paths. */
+  companyId?: string | null;
+  agentId?: string | null;
+  /** Read-write directories of the run itself, such as the agent home and the scratch directory. */
+  runPaths?: string[];
+  /** Working directories of the run's project workspaces, which name the repositories its worktrees belong to. */
+  repoRoots?: string[];
 }
 
 export interface LocalProcessSandboxSpawnTarget {
@@ -338,6 +345,131 @@ server.listen(${SANDBOX_PROXY_PORT}, "127.0.0.1", () => {
   return source.trimStart();
 }
 
+type HostSandboxScope = Partial<Record<"read" | "write" | "workspaceRoots" | "gitRoots", unknown>>;
+
+function ownEntry(group: unknown, key: string | null): HostSandboxScope | null {
+  if (!key || !group || typeof group !== "object" || !Object.hasOwn(group, key)) return null;
+  const entry = (group as Record<string, unknown>)[key];
+  return entry && typeof entry === "object" ? (entry as HostSandboxScope) : null;
+}
+
+/**
+ * The sandbox paths the host hands to every confined run, from the JSON in
+ * PAPERCLIP_SANDBOX_PATHS: `read`, `write`, `workspaceRoots` and `gitRoots`
+ * lists at the top level, per company under `companies` and per agent under
+ * `agents`, with `{company}` standing for the run's company; `projects` and
+ * `workspaces` name the directories holding the company projects and the
+ * agent workspaces.
+ */
+function hostSandboxPaths(options: LocalProcessSandboxOptions) {
+  let parsed: Record<string, unknown> = {};
+  try {
+    const value: unknown = JSON.parse(process.env.PAPERCLIP_SANDBOX_PATHS ?? "{}");
+    if (value && typeof value === "object" && !Array.isArray(value)) parsed = value as Record<string, unknown>;
+  } catch {
+    parsed = {};
+  }
+  const company =
+    typeof options.companyId === "string" && /^[0-9a-z-]+$/.test(options.companyId) ? options.companyId : null;
+  const scopes = [
+    parsed as HostSandboxScope,
+    ownEntry(parsed.companies, company),
+    ownEntry(parsed.agents, typeof options.agentId === "string" ? options.agentId : null),
+  ];
+  const paths = (key: keyof HostSandboxScope): string[] =>
+    scopes
+      .flatMap((scope) => {
+        const list = scope?.[key];
+        return Array.isArray(list) ? list : [];
+      })
+      .filter((entry): entry is string => typeof entry === "string" && (company !== null || !entry.includes("{company}")))
+      .map((entry) => entry.replaceAll("{company}", company ?? ""));
+  const directory = (value: unknown) => (typeof value === "string" && path.isAbsolute(value) ? value : null);
+  return {
+    read: paths("read"),
+    write: paths("write"),
+    workspaceRoots: paths("workspaceRoots"),
+    gitRoots: paths("gitRoots"),
+    projects: directory(parsed.projects),
+    workspaces: directory(parsed.workspaces),
+    company,
+  };
+}
+
+/**
+ * The common git directory of a worktree workspace. The run writes its `.git`
+ * link, so the directory counts only when it lies under one of the run's own
+ * roots, is the `.git` of a repository the server's workspace record names
+ * (when the record names any), and its `worktrees/<name>/gitdir` points back at
+ * this workspace's `.git`.
+ */
+async function sandboxGitCommonDir(workspaceDir: string, roots: string[], repoRoots: string[]): Promise<string | null> {
+  const dotGit = path.join(workspaceDir, ".git");
+  const link = await fs.readFile(dotGit, "utf8").catch(() => null);
+  const gitDir = link?.match(/^gitdir: (.+)$/m)?.[1]?.trim();
+  if (!gitDir) return null;
+  const worktreeGitDir = await fs.realpath(path.resolve(workspaceDir, gitDir)).catch(() => null);
+  const common = worktreeGitDir && (await fs.readFile(path.join(worktreeGitDir, "commondir"), "utf8").catch(() => null));
+  const commonDir = common && worktreeGitDir
+    ? await fs.realpath(path.resolve(worktreeGitDir, common.trim())).catch(() => null)
+    : null;
+  if (!commonDir || !worktreeGitDir || path.dirname(worktreeGitDir) !== path.join(commonDir, "worktrees")) return null;
+  const back = await fs.readFile(path.join(worktreeGitDir, "gitdir"), "utf8").catch(() => null);
+  const [backReal, ownReal] = await Promise.all([
+    back ? fs.realpath(back.trim()).catch(() => null) : null,
+    fs.realpath(dotGit).catch(() => null),
+  ]);
+  if (!backReal || backReal !== ownReal) return null;
+  const realRoots = await Promise.all(roots.map((root) => fs.realpath(root).catch(() => path.resolve(root))));
+  if (!realRoots.some((root) => commonDir.startsWith(`${root}/`))) return null;
+  const recorded = await Promise.all(repoRoots.map((root) => fs.realpath(path.join(root, ".git")).catch(() => null)));
+  if (repoRoots.length > 0 && !recorded.includes(commonDir)) return null;
+  return commonDir;
+}
+
+/**
+ * What git reads to decide what runs, in each repository at `root`, up to two
+ * levels under it, or in the project repositories Paperclip keeps inside any
+ * directory visited (`.paperclip-repositories/*`, where the server runs git,
+ * and `.paperclip-runtime/detached-repositories/*`): a repository's `config`,
+ * `config.worktree`, `hooks`, `info` and `commondir` (a missing `commondir`
+ * is written as ".", which names the repository itself; git dies on an empty
+ * one), its worktrees' pointers, and a worktree's `.git` link.
+ */
+async function gitMetadataUnder(root: string): Promise<string[]> {
+  const found: string[] = [];
+  const repository = async (dir: string) => {
+    for (const name of ["hooks", "info"]) await fs.mkdir(path.join(dir, name), { recursive: true }).catch(() => undefined);
+    await fs.writeFile(path.join(dir, "commondir"), ".\n", { flag: "wx", mode: 0o644 }).catch(() => undefined);
+    found.push(...["config", "config.worktree", "hooks", "info", "commondir"].map((name) => path.join(dir, name)));
+    for (const worktree of await fs.readdir(path.join(dir, "worktrees")).catch(() => [] as string[])) {
+      found.push(...["config.worktree", "commondir", "gitdir"].map((name) => path.join(dir, "worktrees", worktree, name)));
+    }
+  };
+  const visit = async (dir: string, level: number): Promise<void> => {
+    if (!(await fs.lstat(dir).catch(() => null))?.isDirectory()) return;
+    const dotGit = await fs.lstat(path.join(dir, ".git")).catch(() => null);
+    if (dotGit?.isDirectory()) await repository(path.join(dir, ".git"));
+    else if (dotGit?.isFile()) found.push(path.join(dir, ".git"));
+    else if ((await pathExists(path.join(dir, "HEAD"))) && (await pathExists(path.join(dir, "objects")))) {
+      await repository(dir);
+      return;
+    }
+    if (level < 2) {
+      for (const entry of await fs.readdir(dir, { withFileTypes: true }).catch(() => [])) {
+        if (entry.isDirectory() && entry.name !== ".git") await visit(path.join(dir, entry.name), level + 1);
+      }
+    }
+    for (const kept of [".paperclip-repositories", path.join(".paperclip-runtime", "detached-repositories")]) {
+      for (const entry of await fs.readdir(path.join(dir, kept), { withFileTypes: true }).catch(() => [])) {
+        if (entry.isDirectory()) await visit(path.join(dir, kept, entry.name), 2);
+      }
+    }
+  };
+  await visit(root, 0);
+  return found;
+}
+
 export async function buildLocalProcessSandboxSpawnTarget(input: {
   executable: string;
   args: string[];
@@ -386,30 +518,170 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
 
   if (filesystemScope === "workspace") {
     args.push("--tmpfs", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp");
-    args.push(
-      "--symlink", "usr/bin", "/bin",
-      "--symlink", "usr/sbin", "/sbin",
-      "--symlink", "usr/lib", "/lib",
-      "--symlink", "usr/lib64", "/lib64",
-    );
+    // The links exist only where the host has them: NixOS keeps /bin a
+    // directory of its own, with /bin/sh in it.
+    for (const [target, link] of [["usr/bin", "/bin"], ["usr/sbin", "/sbin"], ["usr/lib", "/lib"], ["usr/lib64", "/lib64"]]) {
+      if ((await fs.lstat(link).catch(() => null))?.isSymbolicLink()) args.push("--symlink", target, link);
+    }
     const created = new Set<string>(["/", "/proc", "/dev", "/tmp"]);
     const mounted = new Set<string>();
     const mount = async (source: string, access: LocalProcessSandboxAccess) => {
       const normalized = normalizeAbsolutePath(source, "Sandbox path");
       if (mounted.has(normalized) || !(await pathExists(normalized))) return;
       addParentDirectories(args, created, normalized);
-      args.push(access === "rw" ? "--bind" : "--ro-bind", normalized, normalized);
+      // The source is the realpath: the host checks a run-controlled path by its
+      // realpath, and binding that same path leaves no window for a symlink swap
+      // between the check and bwrap's open.
+      args.push(
+        access === "rw" ? "--bind" : "--ro-bind",
+        await fs.realpath(normalized).catch(() => normalized),
+        normalized,
+      );
       mounted.add(normalized);
       created.add(normalized);
     };
     for (const systemPath of SYSTEM_READ_PATHS) await mount(systemPath, "ro");
+    const host = hostSandboxPaths(input.options);
+    // The workspace and every extra path lie under the company's projects/
+    // directory, the agent's workspaces/ directory or a root the host names for
+    // the company, and the command in the Nix store, whatever the agent's
+    // configuration says.
+    const ownRoots = await Promise.all(
+      [
+        host.projects && host.company ? path.join(host.projects, host.company) : null,
+        host.workspaces && typeof input.options.agentId === "string"
+          ? path.join(host.workspaces, input.options.agentId)
+          : null,
+        ...host.workspaceRoots,
+      ]
+        .filter((root): root is string => Boolean(root))
+        .map((root) => fs.realpath(root).catch(() => path.resolve(root))),
+    );
+    const owned = async (candidate: string) => {
+      const real = await fs.realpath(candidate).catch(() => null);
+      return real !== null && ownRoots.some((root) => real === root || real.startsWith(`${root}/`));
+    };
+    const refuse = (what: string): never => {
+      throw new Error(`Paperclip host refuses the confined run: ${what}.`);
+    };
+    if (!(await owned(workspaceDir))) refuse(`its workspace "${workspaceDir}" is none of its company's`);
+    for (const extraPath of input.options.extraPaths ?? []) {
+      if (!(await owned(extraPath.path))) refuse(`its extra path "${extraPath.path}" is none of its company's`);
+    }
+    if (!(await fs.realpath(input.executable).catch(() => "")).startsWith("/nix/store/")) {
+      refuse(`its command "${input.executable}" is not in the Nix store`);
+    }
+    // Of two nested host paths the deeper one's access wins: bwrap applies
+    // binds in order, so shallower ones go first.
+    for (const hostPath of host.write) await fs.mkdir(hostPath, { recursive: true, mode: 0o700 }).catch(() => undefined);
+    const bindDepth = (entry: { path: string }) => path.resolve(entry.path).split("/").length;
+    const hostBinds: LocalProcessSandboxPath[] = [
+      ...host.read.map((hostPath): LocalProcessSandboxPath => ({ path: hostPath, access: "ro" })),
+      ...host.write.map((hostPath): LocalProcessSandboxPath => ({ path: hostPath, access: "rw" })),
+    ];
+    for (const entry of hostBinds.sort((a, b) => bindDepth(a) - bindDepth(b))) await mount(entry.path, entry.access);
+    const mountedCovers = (candidate: string) =>
+      Array.from(mounted).some((mountedPath) => candidate === mountedPath || candidate.startsWith(`${mountedPath}/`));
+    // A link directly in a writable managed directory (a kept session in the
+    // provider home) keeps that access; a deeper one (a skill in the prompt
+    // bundle or CODEX_HOME) is read-only.
+    const mountLinkTargets = async (directory: string, access: LocalProcessSandboxAccess, depth: number): Promise<void> => {
+      const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        const candidate = path.join(directory, entry.name);
+        if (entry.isSymbolicLink()) {
+          const target = await fs.realpath(candidate).catch(() => null);
+          if (target && (access === "rw" || !mountedCovers(target))) await mount(target, access);
+        } else if (entry.isDirectory() && depth > 1) {
+          await mountLinkTargets(candidate, "ro", depth - 1);
+        }
+      }
+    };
     for (const executablePath of await executableReadPaths(input.executable)) await mount(executablePath, "ro");
     if (networkScope === "allowlist") {
       for (const nodePath of await executableReadPaths(process.execPath)) await mount(nodePath, "ro");
     }
-    for (const managedPath of input.options.managedPaths ?? []) await mount(managedPath.path, managedPath.access);
+    for (const managedPath of input.options.managedPaths ?? []) {
+      await mount(managedPath.path, managedPath.access);
+      await mountLinkTargets(managedPath.path, managedPath.access, 3);
+    }
     for (const extraPath of input.options.extraPaths ?? []) await mount(extraPath.path, extraPath.access);
     await mount(workspaceDir, "rw");
+    for (const runPath of input.options.runPaths ?? []) await mount(runPath, "rw");
+    const commonDir = await sandboxGitCommonDir(
+      workspaceDir,
+      ownRoots,
+      (input.options.repoRoots ?? []).filter((root) => typeof root === "string" && path.isAbsolute(root)),
+    );
+    if (commonDir && !mountedCovers(commonDir)) await mount(commonDir, "rw");
+    // The server runs git in this workspace unconfined, so the run gets
+    // read-only every file git reads to decide whether a config command runs or
+    // where the repository is: the `.git` link, each repository's `config`,
+    // `config.worktree`, `hooks` and `info`, and a linked worktree's
+    // `commondir`/`gitdir` pointers, which a run could otherwise rewrite to
+    // steer the server's git at a repository it built. Together with the
+    // server's GIT_CONFIG_PARAMETERS this closes the command-running config keys
+    // for worktree workspaces; a plain clone's config stays the repository's own,
+    // bound here.
+    const dotGit = path.join(workspaceDir, ".git");
+    const dotGitStat = await fs.lstat(dotGit).catch(() => null);
+    const readOnlyTargets = new Set<string>();
+    if (dotGitStat?.isFile()) readOnlyTargets.add(dotGit);
+    for (const repository of [dotGitStat?.isDirectory() ? dotGit : null, commonDir]) {
+      if (!repository) continue;
+      for (const name of ["hooks", "info"]) await fs.mkdir(path.join(repository, name), { recursive: true }).catch(() => undefined);
+      // git follows a main repository's own `commondir` too, and dies on an
+      // empty one, so a missing one is written as `.`, which names the
+      // repository itself, and bound read-only with the rest.
+      await fs.writeFile(path.join(repository, "commondir"), ".\n", { flag: "wx", mode: 0o644 }).catch(() => undefined);
+      for (const name of ["config", "config.worktree", "hooks", "info", "commondir"]) {
+        readOnlyTargets.add(path.join(repository, name));
+      }
+    }
+    // Only for the worktree whose common directory validated: a rejected
+    // redirect's gitdir points into another workspace, which stays unbound.
+    const worktreeGitDir = commonDir && dotGitStat?.isFile()
+      ? await fs
+          .realpath(
+            path.resolve(
+              workspaceDir,
+              (await fs.readFile(dotGit, "utf8").catch(() => ""))?.match(/^gitdir: (.+)$/m)?.[1]?.trim() ?? "/nonexistent",
+            ),
+          )
+          .catch(() => null)
+      : null;
+    if (worktreeGitDir) {
+      for (const name of ["config.worktree", "commondir", "gitdir"]) readOnlyTargets.add(path.join(worktreeGitDir, name));
+    }
+    for (const target of readOnlyTargets) await mount(target, "ro");
+    // Last, so no read-write bind above covers them: the host's read paths under
+    // the run's own read-write paths, and the git metadata of every repository in
+    // the workspace (Paperclip's project repositories among them) or under a
+    // gitRoots directory the run sees, which the server's unconfined git reads
+    // when it runs there.
+    const laterWritable = [workspaceDir, ...(input.options.runPaths ?? []), commonDir]
+      .filter((root): root is string => Boolean(root))
+      .map((root) => path.resolve(root));
+    const rebindReadOnly = async (target: string) => {
+      mounted.delete(path.resolve(target));
+      await mount(target, "ro");
+    };
+    for (const hostPath of host.read) {
+      if (laterWritable.some((root) => path.resolve(hostPath).startsWith(`${root}/`))) await rebindReadOnly(hostPath);
+    }
+    for (const root of [workspaceDir, ...host.gitRoots]) {
+      if (!mountedCovers(path.resolve(root))) continue;
+      for (const target of await gitMetadataUnder(root)) await rebindReadOnly(target);
+    }
+    // The agents' rootless docker daemon, when the host hands it to confined
+    // runs. The daemon runs as the server's user and bind-mounts any path it
+    // can read, so a run with it reaches every company's files.
+    const dockerSocket = process.env.PAPERCLIP_SANDBOX_DOCKER_SOCKET;
+    if (dockerSocket && path.isAbsolute(dockerSocket) && (await pathExists(dockerSocket))) {
+      await mount(dockerSocket, "rw");
+      env.DOCKER_HOST = `unix://${dockerSocket}`;
+      env.TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE = dockerSocket;
+    }
     for (const [index, alias] of (input.options.pathAliases ?? []).entries()) {
       const aliasPath = normalizeAbsolutePath(alias.path, `Sandbox pathAliases[${index}].path`);
       const aliasTarget = normalizeAbsolutePath(alias.target, `Sandbox pathAliases[${index}].target`);
