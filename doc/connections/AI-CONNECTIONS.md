@@ -345,17 +345,19 @@ identity before reusing the session; changing identity retires the previous owne
 Other managed harnesses retain per-turn cleanup. A suspended native execution
 whose credential identity changed must restart as a new execution.
 
-Local managed Claude and Codex runs keep transcript directories under
-`<instanceRoot>/managed-ai-sessions/<scope>/`. The scope includes company,
-agent, grant, responsible user, and provider. Each temporary provider home links
-only Claude's `projects` or Codex's `sessions` and `archived_sessions` directories
-to that storage. Authentication files and runtime configuration remain in the
-private per-run home and are removed by normal cleanup. Transcript storage is
-sensitive task data. Include it in instance backups. Run cleanup does not remove
-it, and no automatic transcript garbage collection is added. Previously deleted
-transcripts cannot be recovered.
-This storage applies to local execution; remote sandbox transcript persistence
-is unchanged.
+Local managed Claude and Codex runs of the companies named in
+`PAPERCLIP_KEPT_AI_SESSION_COMPANIES` (a comma-separated list of company ids;
+empty by default) keep transcript directories under
+`<instanceRoot>/managed-ai-sessions/<company>/<scope>/`. The scope includes
+company, agent, grant, responsible user, and harness (`claude_local` or
+`codex_local`, which an ACP run of Claude Code or Codex shares with the CLI
+run). Runs of other companies keep no transcripts past the run. Each temporary
+provider home links only Claude's `projects` or Codex's `sessions` and
+`archived_sessions` directories to that storage, when the home is prepared.
+Authentication files and runtime configuration remain in the private per-run
+home and are removed by normal cleanup. Transcript storage is sensitive task
+data. Include it in instance backups. Run cleanup does not remove it, and no
+automatic transcript garbage collection is added.
 
 Both heartbeat and ACP session fingerprints normalize only environment values
 that exactly match paths generated from the current managed AI home. Custom

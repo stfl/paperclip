@@ -79,17 +79,18 @@ describe("managed AI connections", () => {
     await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
     await create(userId, "transcript-connection");
     const runInput = { ...input, responsibleUserId: userId, config: { cwd: home } };
-    const first = await prepareManagedAiRuntime(db, runInput);
-    await first.prepareLocalSessionState();
-    await writeFile(path.join(first.home, "provider", "projects", "session.jsonl"), "conversation");
-    await first.cleanup();
-    await expect(access(first.home)).rejects.toMatchObject({ code: "ENOENT" });
-    const second = await prepareManagedAiRuntime(db, runInput);
+    vi.stubEnv("PAPERCLIP_KEPT_AI_SESSION_COMPANIES", companyId);
     try {
-      await second.prepareLocalSessionState();
-      expect(await readFile(path.join(second.home, "provider", "projects", "session.jsonl"), "utf8")).toBe("conversation");
-      expect(second.home).not.toBe(first.home);
-    } finally { await second.cleanup(); }
+      const first = await prepareManagedAiRuntime(db, runInput);
+      await writeFile(path.join(first.home, "provider", "projects", "session.jsonl"), "conversation");
+      await first.cleanup();
+      await expect(access(first.home)).rejects.toMatchObject({ code: "ENOENT" });
+      const second = await prepareManagedAiRuntime(db, runInput);
+      try {
+        expect(await readFile(path.join(second.home, "provider", "projects", "session.jsonl"), "utf8")).toBe("conversation");
+        expect(second.home).not.toBe(first.home);
+      } finally { await second.cleanup(); }
+    } finally { vi.stubEnv("PAPERCLIP_KEPT_AI_SESSION_COMPANIES", ""); }
   });
 
   it.each([

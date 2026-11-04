@@ -311,6 +311,14 @@ export async function prepareManagedAiRuntime(
     );
     const providerHome = path.join(home, "provider");
     await mkdir(providerHome, { mode: 0o700 });
+    await linkManagedAiSessionState({
+      home,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      grantId: selection.grant.id,
+      responsibleUserId: input.responsibleUserId,
+      harness,
+    });
     const env: Record<string, unknown> = {
       ...stripAiAuthBindings(input.config.env),
       ...Object.fromEntries(AI_AUTH_ENV_KEYS.map((key) => [key, ""])),
@@ -403,14 +411,6 @@ export async function prepareManagedAiRuntime(
       accountOwnerUserId: selection.grant.subjectUserId,
       identity,
       home,
-      prepareLocalSessionState: () => linkManagedAiSessionState({
-        home: home!,
-        companyId: input.companyId,
-        agentId: input.agentId,
-        grantId: selection.grant.id,
-        responsibleUserId: input.responsibleUserId,
-        provider: input.binding.provider,
-      }),
       cleanup: async () => {
         if (subscriptionFile) {
           const refreshed = await readFile(authFile, "utf8");

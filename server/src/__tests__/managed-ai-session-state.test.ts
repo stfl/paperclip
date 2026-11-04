@@ -11,11 +11,12 @@ afterEach(async () => {
 });
 
 describe("managed AI transcript storage", () => {
-  it.each([["anthropic", "projects"], ["openai", "sessions"], ["openai", "archived_sessions"]])(
-    "retains %s %s across cleanup without retaining credentials", async (provider, directory) => {
+  it.each([["claude_local", "projects"], ["codex_local", "sessions"], ["codex_local", "archived_sessions"]])(
+    "retains %s %s across cleanup without retaining credentials", async (harness, directory) => {
       root = await mkdtemp(path.join(os.tmpdir(), "managed-ai-state-test-"));
       vi.stubEnv("PAPERCLIP_HOME", root);
-      const scope = { companyId: "company", agentId: "agent", grantId: "grant", responsibleUserId: "user", provider };
+      vi.stubEnv("PAPERCLIP_KEPT_AI_SESSION_COMPANIES", "company, other");
+      const scope = { companyId: "company", agentId: "agent", grantId: "grant", responsibleUserId: "user", harness };
       async function prepare(overrides = {}) {
         const home = await mkdtemp(path.join(root, "run-"));
         await mkdir(path.join(home, "provider"));
@@ -38,6 +39,11 @@ describe("managed AI transcript storage", () => {
         const other = await prepare(overrides);
         expect(await readdir(path.join(other, "provider", directory))).toEqual([]);
       }
+      const unlisted = await prepare({ companyId: "unlisted" });
+      await expect(readdir(path.join(unlisted, "provider", directory))).rejects.toMatchObject({ code: "ENOENT" });
+      // A probe for an agent that does not exist yet has no scope of its own.
+      const probe = await prepare({ agentId: "" });
+      await expect(readdir(path.join(probe, "provider", directory))).rejects.toMatchObject({ code: "ENOENT" });
       // Concurrent runs share transcripts but never the credential home.
       const concurrent = await prepare();
       expect(concurrent).not.toBe(second);
