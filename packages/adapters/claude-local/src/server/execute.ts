@@ -844,7 +844,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     attemptInstructionsFilePath: string | undefined,
   ) => {
     const args = ["--print", "--output-format", "stream-json", "--verbose"];
-    if (config.managedAiConnection) args.push("--setting-sources", "user");
+    // "user" alone loads neither the repository's CLAUDE.md nor the skills of the
+    // prompt bundle passed with --add-dir. The ACP engine opens its session with
+    // the project and local sources, so the CLI engine reads the same ones beside
+    // the per-run user directory.
+    if (config.managedAiConnection) args.push("--setting-sources", "user,project,local");
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     args.push(...buildClaudeExecutionPermissionArgs({
       dangerouslySkipPermissions,
