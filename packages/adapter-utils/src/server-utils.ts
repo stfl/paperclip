@@ -3678,8 +3678,21 @@ async function resolveSpawnTarget(
     if (!resolved) {
       throw new Error(`Command not found in PATH: "${command}"`);
     }
-    const requestedSandboxCommand =
+    // The host names its own bubblewrap; an agent's configuration may leave the
+    // default or name that one, and nothing else.
+    const configuredSandboxCommand =
       options.localProcessSandbox.command?.trim() || "bwrap";
+    const hostSandboxCommand = process.env.PAPERCLIP_SANDBOX_BWRAP;
+    if (
+      hostSandboxCommand &&
+      configuredSandboxCommand !== "bwrap" &&
+      configuredSandboxCommand !== hostSandboxCommand
+    ) {
+      throw new Error(
+        `Paperclip host refuses the confined run: filesystemSandboxCommand "${configuredSandboxCommand}" is not the host bubblewrap.`,
+      );
+    }
+    const requestedSandboxCommand = hostSandboxCommand || configuredSandboxCommand;
     const sandboxCommand = await resolveCommandPath(
       requestedSandboxCommand,
       cwd,
