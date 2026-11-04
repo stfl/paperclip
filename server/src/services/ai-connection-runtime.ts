@@ -23,6 +23,11 @@ import { WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE } from "@paperclipai/adapter-utils/
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { decideGrokAuthMerge } from "@paperclipai/adapter-grok-local/server";
+import {
+  managedAiHomeEnvironment,
+  managedAiSessionEnvironment,
+} from "@paperclipai/adapter-utils/managed-ai-home";
+import { linkManagedAiSessionState } from "./managed-ai-session-state.js";
 
 export function isAiConnectionBusy(error: unknown): error is HttpError {
   return error instanceof HttpError && error.status === 422 &&
@@ -189,30 +194,16 @@ done`,
   }
 }
 
-function managedAiHomeEnvironment(home: string): Record<string, string> {
-  const providerHome = path.join(home, "provider");
-  return {
-    HOME: home,
-    XDG_CONFIG_HOME: path.join(home, "config"),
-    XDG_DATA_HOME: path.join(home, "data"),
-    CODEX_HOME: providerHome,
-    GROK_HOME: providerHome,
-    CLAUDE_CONFIG_DIR: providerHome,
-    HERMES_HOME: providerHome,
-  };
-}
-
 /** Only the server-created credential home is volatile; retain all other config. */
 export function managedAiSessionFingerprintConfig(
   config: Record<string, unknown>,
   managedHome: string | undefined,
 ): Record<string, unknown> {
   if (!managedHome) return config;
-  const env = { ...(config.env as Record<string, unknown> | undefined) };
-  const stable = managedAiHomeEnvironment("<managed-ai-home>");
-  for (const [key, value] of Object.entries(managedAiHomeEnvironment(managedHome))) {
-    if (env[key] === value) env[key] = stable[key];
-  }
+  const env: Record<string, unknown> = managedAiSessionEnvironment(
+    (config.env as Record<string, unknown> | undefined) ?? {},
+    managedHome,
+  );
   const managed = config.managedAiConnection as Record<string, unknown> | undefined;
   if (managed?.sessionIdentity) {
     for (const key of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY", "GROK_API_KEY", "OPENCODE_AUTH_JSON", "OPENCODE_CONFIG_CONTENT"]) {
@@ -412,6 +403,14 @@ export async function prepareManagedAiRuntime(
       accountOwnerUserId: selection.grant.subjectUserId,
       identity,
       home,
+      prepareLocalSessionState: () => linkManagedAiSessionState({
+        home: home!,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        grantId: selection.grant.id,
+        responsibleUserId: input.responsibleUserId,
+        provider: input.binding.provider,
+      }),
       cleanup: async () => {
         if (subscriptionFile) {
           const refreshed = await readFile(authFile, "utf8");
