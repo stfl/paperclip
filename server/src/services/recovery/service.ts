@@ -101,6 +101,7 @@ import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { hasUnverifiedNativeWorkspaceFinalizationOwner } from "../native-runtime/native-workspace-finalization-recovery-state.js";
 import {
   legacyExecutionNeedsReconciliationWithEvidence,
+  legacyExecutionNeedsWorkspaceRepair,
   terminalizeLegacyExecution,
 } from "../legacy-execution-recovery.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
@@ -2102,9 +2103,17 @@ export function recoveryService(
             eq(heartbeatRuns.agentId, input.agentId),
           ),
         );
-      if (
+      if (predecessor && isConfirmedReassignmentStop(predecessor)) {
+        if (await legacyExecutionNeedsWorkspaceRepair(db, predecessor)) {
+          await terminalizeLegacyExecution({
+            db,
+            run: predecessor,
+            status: predecessor.status,
+          });
+          return null;
+        }
+      } else if (
         predecessor &&
-        !isConfirmedReassignmentStop(predecessor) &&
         ["failed", "timed_out", "interrupted", "cancelled"].includes(
           predecessor.status,
         )
@@ -4880,7 +4889,6 @@ export function recoveryService(
       if (
         executionRecoverySource &&
         executionRecoverySource.agentId === agentId &&
-        !isConfirmedReassignmentStop(executionRecoverySource) &&
         ["failed", "timed_out", "interrupted", "cancelled"].includes(
           executionRecoverySource.status,
         )
@@ -4894,7 +4902,14 @@ export function recoveryService(
               eq(heartbeatRuns.id, executionRecoverySource.id),
             ),
           );
-        if (source && await legacyExecutionNeedsReconciliationWithEvidence(db, source)) {
+        // A confirmed hand-over stop ended as asked, so only its unrestored
+        // files hold it.
+        if (
+          source &&
+          (isConfirmedReassignmentStop(source)
+            ? await legacyExecutionNeedsWorkspaceRepair(db, source)
+            : await legacyExecutionNeedsReconciliationWithEvidence(db, source))
+        ) {
           await terminalizeLegacyExecution({
             db,
             run: source,

@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { eq, inArray } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
   companies,
   companyMemberships,
   createDb,
+  environmentLeases,
+  environments,
   heartbeatRuns,
   issueRecoveryActions,
   issues,
@@ -15,6 +17,18 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { recoveryService } from "../services/recovery/service.js";
+
+// Runs whose first remote-workspace check reports nothing, as when copy-back
+// reports its failure only after the sweep's gate has looked.
+const lateCopyBack = vi.hoisted(() => new Set<string>());
+vi.mock("../services/legacy-workspace-restore-recovery.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/legacy-workspace-restore-recovery.js")>();
+  return {
+    ...actual,
+    hasUnrestoredRemoteWorkspace: async (...args: Parameters<typeof actual.hasUnrestoredRemoteWorkspace>) =>
+      lateCopyBack.delete(args[1].id) ? false : actual.hasUnrestoredRemoteWorkspace(...args),
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -167,6 +181,101 @@ describeEmbeddedPostgres("stranded sweep and in-run hand-overs", () => {
     expect(result).toMatchObject({ escalated: 1, issueIds: [f.issueId] });
     const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
     expect(issue).toMatchObject({ status: "blocked", assigneeAgentId: f.assignee });
+  });
+
+  // The assignee's own legacy run on a remote workspace, stopped by a
+  // hand-over that came back to it, whose copy-back failed. With `lease` the
+  // sandbox still holds the unrestored files.
+  async function seedStoppedRemoteRun(lease: boolean) {
+    const { companyId, ids: [a] } = await seedCompany(["A"]);
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Hand the work back",
+      status: "todo",
+      assigneeAgentId: a,
+      createdAt: new Date(Date.now() - 60 * 60 * 1000),
+      updatedAt: new Date(Date.now() - 60 * 60 * 1000),
+    });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: a,
+      issueId,
+      runtimeMode: "legacy",
+      ...handover,
+      resultJson: { ...handover.resultJson, workspaceRestoreFailure: "restore_failed" },
+      createdAt: new Date(Date.now() - 6 * 60_000),
+      startedAt: new Date(Date.now() - 6 * 60_000),
+      finishedAt: new Date(Date.now() - 5 * 60_000),
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    }).returning();
+    if (lease) {
+      const [environment] = await db.insert(environments)
+        .values({ name: `Sandbox ${run.id}`, driver: "sandbox" })
+        .returning();
+      await db.insert(environmentLeases).values({
+        companyId,
+        issueId,
+        heartbeatRunId: run.id,
+        environmentId: environment.id,
+        status: "active",
+        leasePolicy: "ephemeral",
+        provider: "daytona",
+        providerLeaseId: randomUUID(),
+        metadata: { remoteCwd: "/work/fixture", driver: "sandbox", sandboxProviderPlugin: true },
+      });
+    }
+    seededRemoteIssues.push(issueId);
+    return { companyId, issueId, assignee: a, runId: run.id };
+  }
+
+  // A held issue stays todo; hidden, it leaves the later tests' sweeps.
+  const seededRemoteIssues: string[] = [];
+  afterEach(async () => {
+    if (seededRemoteIssues.length === 0) return;
+    await db.update(issues).set({ hiddenAt: new Date() }).where(inArray(issues.id, seededRemoteIssues.splice(0)));
+  });
+
+  async function expectHeldForWorkspaceRepair(f: { issueId: string; runId: string }) {
+    const actions = await recoveryActionsOf(f.issueId);
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ ownerType: "board", cause: "legacy_execution_requires_reconciliation" });
+  }
+
+  it("holds a hand-over stop with unrestored remote files for the workspace repair at the sweep's gate", async () => {
+    const f = await seedStoppedRemoteRun(true);
+    const enqueueWakeup = vi.fn();
+
+    const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ escalated: 1, issueIds: [f.issueId] });
+    await expectHeldForWorkspaceRepair(f);
+  });
+
+  it("holds a hand-over stop whose copy-back failure lands after the gate when the recovery is queued", async () => {
+    const f = await seedStoppedRemoteRun(true);
+    lateCopyBack.add(f.runId);
+    const enqueueWakeup = vi.fn();
+
+    const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+
+    expect(lateCopyBack.has(f.runId)).toBe(false);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ escalated: 0, dispatchRequeued: 0 });
+    await expectHeldForWorkspaceRepair(f);
+  });
+
+  it("requeues the assignee after a hand-over stop whose remote files need no repair", async () => {
+    const f = await seedStoppedRemoteRun(false);
+    const enqueueWakeup = recordingEnqueue(f.companyId, f.issueId);
+
+    const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ escalated: 0, dispatchRequeued: 1, issueIds: [f.issueId] });
+    expect(enqueueWakeup).toHaveBeenCalledWith(f.assignee, expect.anything());
+    expect(await recoveryActionsOf(f.issueId)).toHaveLength(0);
   });
 
   // An in_progress issue handed on from inside continuation runs. Each
