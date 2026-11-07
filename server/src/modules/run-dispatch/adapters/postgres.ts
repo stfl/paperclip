@@ -143,11 +143,11 @@ function readNonEmptyString(value: unknown): string | null {
 const AGENT_CARD_WAKES_PER_HUMAN_TURN = 10;
 
 // Agent-created cards addressed to an agent on the issue, created after its
-// latest human turn (a board comment or a board-created card) and no later
-// than `until`.
+// latest human turn (a board comment or a board-created card): the card
+// `interactionId` and those created before it.
 async function countAgentCardsSinceHumanTurn(
   db: Db,
-  input: { companyId: string; issueId: string; until: Date },
+  input: { companyId: string; issueId: string; interactionId: string },
 ) {
   const [humanComment] = await db
     .select({ at: sql<Date | null>`max(${issueComments.createdAt})` })
@@ -184,7 +184,12 @@ async function countAgentCardsSinceHumanTurn(
         eq(issueThreadInteractions.issueId, input.issueId),
         isNotNull(issueThreadInteractions.createdByAgentId),
         isNotNull(issueThreadInteractions.addresseeAgentId),
-        lte(issueThreadInteractions.createdAt, input.until),
+        // Compared in SQL: created_at keeps microseconds, which a JS Date
+        // read back from it drops.
+        or(
+          eq(issueThreadInteractions.id, input.interactionId),
+          sql`${issueThreadInteractions.createdAt} < (select card.created_at from issue_thread_interactions card where card.id = ${input.interactionId})`,
+        ),
         ...(since ? [gt(issueThreadInteractions.createdAt, since)] : []),
       ),
     );
@@ -623,10 +628,7 @@ export function createPostgresRunDispatchAdapter(
       !isInteractionWake && issue && wakeReason === "interaction_pending" && interactionId &&
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(interactionId)
         ? await dbOrTx
-            .select({
-              createdByAgentId: issueThreadInteractions.createdByAgentId,
-              createdAt: issueThreadInteractions.createdAt,
-            })
+            .select({ createdByAgentId: issueThreadInteractions.createdByAgentId })
             .from(issueThreadInteractions)
             .where(
               and(
@@ -652,7 +654,7 @@ export function createPostgresRunDispatchAdapter(
         (await countAgentCardsSinceHumanTurn(dbOrTx, {
           companyId: input.companyId,
           issueId: issue!.id,
-          until: addresseeCard.createdAt,
+          interactionId: interactionId!,
         })) <= AGENT_CARD_WAKES_PER_HUMAN_TURN);
     const retryReason =
       readNonEmptyString(context.retryReason) ?? input.scheduledRetryReason ?? null;
