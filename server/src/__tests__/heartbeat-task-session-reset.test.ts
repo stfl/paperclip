@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import {
@@ -256,5 +259,75 @@ describePostgres("task-scoped runtime session reset", () => {
         a.id.localeCompare(b.id),
       ),
     ).toEqual(expected.sort((a, b) => a.id.localeCompare(b.id)));
+  });
+});
+
+describePostgres("runtime session reset removes the ACP engine's session records (paperclipai/paperclip#14053)", () => {
+  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let db: ReturnType<typeof createDb>;
+  const roots: string[] = [];
+
+  beforeAll(async () => {
+    database = await startEmbeddedPostgresTestDatabase("paperclip-acp-record-reset-");
+    db = createDb(database.connectionString);
+  }, 20_000);
+
+  afterAll(async () => {
+    await database?.cleanup();
+    await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
+  });
+
+  async function fixture() {
+    const stateDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-acp-state-"));
+    roots.push(stateDir);
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const issueId = randomUUID();
+    const otherIssueId = randomUUID();
+    const identifier = `ACP-${randomUUID().slice(0, 8).toUpperCase()}-1`;
+    await db.insert(companies).values({ id: companyId, name: "ACP reset", issuePrefix: `A${companyId.slice(0, 8).toUpperCase()}` });
+    await db.insert(agents).values([
+      { id: agentId, companyId, name: "ACP agent", adapterType: "claude_local", adapterConfig: { stateDir } },
+      { id: otherAgentId, companyId, name: "Other ACP agent", adapterType: "claude_local", adapterConfig: { stateDir } },
+    ]);
+    await db.insert(issues).values([
+      { id: issueId, companyId, title: "Selected task", identifier },
+      { id: otherIssueId, companyId, title: "Other task", identifier: `${identifier}-OTHER` },
+    ]);
+    await db.insert(agentTaskSessions).values({
+      id: randomUUID(), companyId, agentId, adapterType: "claude_local", taskKey: issueId,
+      sessionDisplayId: "dead-session", sessionParamsJson: { sessionKey: `paperclip:${companyId}:${agentId}:${issueId}:fp1` },
+    });
+    const key = (agent: string, taskKey: string, fingerprint: string) => `paperclip:${companyId}:${agent}:${taskKey}:${fingerprint}`;
+    const selected = [key(agentId, issueId, "fp1"), key(agentId, issueId, "fp2"), key(agentId, identifier, "fp3")];
+    const otherTask = [key(agentId, otherIssueId, "fp1"), key(agentId, `${issueId}:nested`, "fp1")];
+    const otherAgent = [key(otherAgentId, issueId, "fp1")];
+    await mkdir(path.join(stateDir, "sessions"), { recursive: true });
+    for (const sessionKey of [...selected, ...otherTask, ...otherAgent]) {
+      await writeFile(path.join(stateDir, "sessions", `${encodeURIComponent(sessionKey)}.json`), "{}\n");
+    }
+    const exists = async (sessionKey: string) =>
+      await access(path.join(stateDir, "sessions", `${encodeURIComponent(sessionKey)}.json`)).then(() => true, () => false);
+    return { agentId, issueId, identifier, selected, otherTask, otherAgent, exists };
+  }
+
+  it.each(["uuid", "identifier"] as const)("removes the selected task's records via its %s and keeps every other record", async (keyKind) => {
+    const seeded = await fixture();
+    const reset = await heartbeatService(db).resetRuntimeSession(seeded.agentId, {
+      taskKey: keyKind === "uuid" ? seeded.issueId : seeded.identifier.toLowerCase(),
+    });
+    expect(reset?.clearedTaskSessions).toBe(1);
+    expect(reset?.clearedAcpSessionRecords).toBe(seeded.selected.length);
+    for (const sessionKey of seeded.selected) expect(await seeded.exists(sessionKey)).toBe(false);
+    for (const sessionKey of [...seeded.otherTask, ...seeded.otherAgent]) expect(await seeded.exists(sessionKey)).toBe(true);
+  });
+
+  it("removes every record of the agent on a reset of all its sessions", async () => {
+    const seeded = await fixture();
+    const reset = await heartbeatService(db).resetRuntimeSession(seeded.agentId);
+    expect(reset?.clearedAcpSessionRecords).toBe(seeded.selected.length + seeded.otherTask.length);
+    for (const sessionKey of [...seeded.selected, ...seeded.otherTask]) expect(await seeded.exists(sessionKey)).toBe(false);
+    for (const sessionKey of seeded.otherAgent) expect(await seeded.exists(sessionKey)).toBe(true);
   });
 });

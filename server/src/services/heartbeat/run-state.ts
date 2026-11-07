@@ -50,6 +50,7 @@ import {
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
 import { isUuidLike } from "@paperclipai/shared";
+import { acpxEngineStateDir, removeAcpxSessionRecords } from "@paperclipai/adapter-utils/acpx-engine/session-records";
 import { HEARTBEAT_RUN_LIST_DEFAULT_LIMIT, HEARTBEAT_RUN_LIST_MAX_LIMIT } from "@paperclipai/shared";
 import { isUnsafeSessionWorkspaceCwd } from "../session-workspace-cwd.js";
 
@@ -1633,6 +1634,40 @@ export function createHeartbeatRunState(db: Db) {
     });
   }
 
+  /**
+   * The ACP engine reuses an on-disk session record by its key whether or not
+   * a task session names it, so a reset that leaves the record leaves a dead
+   * session for the next run (paperclipai/paperclip#14053). A task key names
+   * the selected issue under both its id and its identifier, as task sessions do.
+   */
+  async function removeAcpSessionRecords(
+    agent: typeof agents.$inferSelect,
+    taskKey: string | null,
+  ): Promise<number> {
+    const stateDir = acpxEngineStateDir(
+      agent.companyId,
+      agent.id,
+      readNonEmptyString(parseObject(agent.adapterConfig).stateDir) ?? undefined,
+    );
+    const base = { stateDir, companyId: agent.companyId, agentId: agent.id };
+    if (!taskKey) return (await removeAcpxSessionRecords(base)).length;
+    const taskKeys = new Set([taskKey]);
+    const [issue] = await db
+      .select({ id: issues.id, identifier: issues.identifier })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, agent.companyId),
+        isUuidLike(taskKey) ? eq(issues.id, taskKey) : eq(issues.identifier, taskKey.toUpperCase()),
+      ));
+    if (issue) {
+      taskKeys.add(issue.id);
+      if (issue.identifier) taskKeys.add(issue.identifier);
+    }
+    let removed = 0;
+    for (const key of taskKeys) removed += (await removeAcpxSessionRecords({ ...base, taskKey: key })).length;
+    return removed;
+  }
+
   async function ensureRuntimeState(agent: typeof agents.$inferSelect) {
     const existing = await getRuntimeState(agent.id);
     if (existing) return existing;
@@ -1838,6 +1873,7 @@ export function createHeartbeatRunState(db: Db) {
             }
           : undefined,
       );
+      const clearedAcpSessionRecords = await removeAcpSessionRecords(agent, taskKey);
       const runtimePatch: Partial<typeof agentRuntimeState.$inferInsert> = {
         sessionId: null,
         lastError: null,
@@ -1860,6 +1896,7 @@ export function createHeartbeatRunState(db: Db) {
         sessionDisplayId: null,
         sessionParamsJson: null,
         clearedTaskSessions,
+        clearedAcpSessionRecords,
       };
     },
 

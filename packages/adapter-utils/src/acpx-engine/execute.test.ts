@@ -8985,3 +8985,178 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
     }
   }, 10000);
 });
+
+describe("ACPX engine dead persistent session record (paperclipai/paperclip#14814)", () => {
+  type Phase = "ensure" | "configure" | "turn";
+  const resumeRequired = (sessionId: string) => Object.assign(
+    new Error(`Persistent ACP session ${sessionId} could not be resumed: Resource not found`),
+    { detailCode: "SESSION_RESUME_REQUIRED" },
+  );
+
+  // Behaves like acpx in persistent mode: it reuses the on-disk record under
+  // the session key whether or not a resume id is passed, defers the load of a
+  // reused record to its first use, and fails that load for a session whose
+  // transcript is gone. The agent has no session/close, so a discarding close
+  // fails before acpx can mark the record for reset.
+  function deadRecordHarness(input: { failAt: Phase; dead: Set<string>; otherFailure?: Error }) {
+    const ensured: Array<Record<string, unknown>> = [];
+    const prompts: string[] = [];
+    let created = 0;
+    const execute = createAcpxEngineExecutor({
+      createRuntime: (options) => {
+        const store = (options as AcpRuntimeOptions).sessionStore as AcpSessionStore;
+        const fail = (phase: Phase, sessionId: string) => {
+          if (input.failAt !== phase) return null;
+          if (input.otherFailure) return input.otherFailure;
+          return input.dead.has(sessionId) ? resumeRequired(sessionId) : null;
+        };
+        return {
+          ensureSession: async (ensure: Record<string, unknown>) => {
+            ensured.push(ensure);
+            const key = ensure.sessionKey as string;
+            const existing = await store.load(key);
+            const reuse = existing && existing.acpx?.reset_on_next_ensure !== true
+              && (!ensure.resumeSessionId || existing.acpSessionId === ensure.resumeSessionId);
+            if (existing && reuse) {
+              const error = fail("ensure", existing.acpSessionId);
+              if (error) throw error;
+              return { sessionKey: key, backend: "acpx", runtimeSessionName: `runtime-${existing.acpSessionId}`,
+                acpxRecordId: key, backendSessionId: existing.acpSessionId, agentSessionId: existing.acpSessionId };
+            }
+            created += 1;
+            const acpSessionId = `session-${created}`;
+            const now = new Date().toISOString();
+            await store.save({
+              schema: "acpx.session.v1", acpxRecordId: key, acpSessionId, agentCommand: "node ./fake-acp.js",
+              cwd: ensure.cwd as string, name: key, createdAt: now, lastUsedAt: now, lastSeq: 0,
+              eventLog: { active_path: path.join(os.tmpdir(), `${acpSessionId}.jsonl`), segment_count: 1, max_segment_bytes: 1024, max_segments: 2 },
+              messages: [], updated_at: now, cumulative_token_usage: {}, request_token_usage: {},
+            } as AcpSessionRecord);
+            return { sessionKey: key, backend: "acpx", runtimeSessionName: `runtime-${acpSessionId}`,
+              acpxRecordId: key, backendSessionId: acpSessionId, agentSessionId: acpSessionId };
+          },
+          setConfigOption: async ({ handle }: { handle: { backendSessionId: string } }) => {
+            const error = fail("configure", handle.backendSessionId);
+            if (error) throw error;
+          },
+          startTurn: ({ handle, text }: { handle: { backendSessionId: string }; text: string }) => {
+            prompts.push(text);
+            const error = fail("turn", handle.backendSessionId);
+            return {
+              events: (async function* () {})(),
+              result: Promise.resolve(error
+                ? { status: "failed", error: { message: error.message, detailCode: (error as { detailCode?: string }).detailCode } }
+                : { status: "completed", stopReason: "end_turn" }),
+              cancel: async () => {},
+            };
+          },
+          close: async ({ discardPersistentState }: { discardPersistentState?: boolean }) => {
+            if (discardPersistentState) throw new Error("Agent does not support session/close.");
+          },
+        } as never;
+      },
+    });
+    return { execute, ensured, prompts };
+  }
+
+  async function run(
+    execute: ReturnType<typeof createAcpxEngineExecutor>,
+    stateDir: string,
+    runtime: Record<string, unknown>,
+    logs: string[] = [],
+  ) {
+    return await execute({
+      runId: "dead-record-run",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: { taskKey: "issue-1", ...runtime },
+      config: {
+        agent: "claude", agentCommand: "node ./fake-acp.js", stateDir, mode: "persistent", thinkingEffort: "high",
+        bootstrapPromptTemplate: "FRESH-SESSION-BOOTSTRAP",
+      },
+      context: { taskId: "issue-1" },
+      getFreshSessionHandoff: async () => "PREVIOUS-RUN-SUMMARY",
+      onLog: async (_stream: string, text: string) => { logs.push(text); },
+      onMeta: async () => {},
+    } as never);
+  }
+
+  async function records(stateDir: string) {
+    const dir = path.join(stateDir, "sessions");
+    const files = (await fs.readdir(dir).catch(() => [] as string[])).filter((file) => file.endsWith(".json"));
+    const store = createRuntimeStore({ stateDir });
+    return await Promise.all(files.map(async (file) =>
+      (await store.load(decodeURIComponent(file.slice(0, -".json".length))))?.acpSessionId));
+  }
+
+  for (const failAt of ["ensure", "configure", "turn"] as const) {
+    for (const resumed of [true, false]) {
+      it(`starts one fresh session in the same run when the ${failAt} step cannot resume the record (${resumed ? "resume id passed" : "no resume id"})`, async () => {
+        const root = await makeTempRoot();
+        const stateDir = path.join(root, "state");
+        const dead = new Set<string>();
+        const harness = deadRecordHarness({ failAt, dead });
+        const first = await run(harness.execute, stateDir, {});
+        expect(first.exitCode).toBe(0);
+        const oldSession = first.sessionParams?.acpSessionId as string;
+        dead.add(oldSession);
+        harness.ensured.length = 0;
+        harness.prompts.length = 0;
+
+        const logs: string[] = [];
+        const second = await run(harness.execute, stateDir,
+          resumed ? { sessionId: oldSession, sessionParams: first.sessionParams } : {}, logs);
+
+        expect(second.exitCode).toBe(0);
+        const newSession = second.sessionParams?.acpSessionId as string;
+        expect(newSession).toBeTruthy();
+        expect(newSession).not.toBe(oldSession);
+        expect(second.clearSession).toBeFalsy();
+        expect(harness.ensured.at(-1)?.resumeSessionId).toBeUndefined();
+        expect(await records(stateDir)).toEqual([newSession]);
+        const replaced = logs.filter((line) => line.includes(oldSession) && line.includes(newSession));
+        expect(replaced).toHaveLength(1);
+        const freshPrompt = harness.prompts.at(-1)!;
+        expect(freshPrompt).toContain("FRESH-SESSION-BOOTSTRAP");
+        expect(freshPrompt).toContain("PREVIOUS-RUN-SUMMARY");
+      });
+    }
+  }
+
+  it("fails the run after one fresh session when the fresh session cannot start either", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const dead = new Set<string>();
+    const harness = deadRecordHarness({ failAt: "configure", dead });
+    const first = await run(harness.execute, stateDir, {});
+    for (const sessionId of [first.sessionParams?.acpSessionId as string, "session-2", "session-3"]) dead.add(sessionId);
+    harness.ensured.length = 0;
+
+    const logs: string[] = [];
+    const second = await run(harness.execute, stateDir, { sessionParams: first.sessionParams }, logs);
+
+    expect(second.exitCode).toBe(1);
+    expect(second.clearSession).toBe(true);
+    expect(harness.ensured).toHaveLength(2);
+    expect(harness.ensured[1]?.resumeSessionId).toBeUndefined();
+    expect(logs.filter((line) => line.includes(first.sessionParams?.acpSessionId as string)
+      && line.includes("session-2"))).toHaveLength(1);
+    expect(await records(stateDir)).toEqual([]);
+  });
+
+  it("keeps the record and fails the run for a setup failure that is not a dead session", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const dead = new Set<string>();
+    const ok = deadRecordHarness({ failAt: "configure", dead });
+    const first = await run(ok.execute, stateDir, {});
+    const oldSession = first.sessionParams?.acpSessionId as string;
+    const failing = deadRecordHarness({ failAt: "configure", dead, otherFailure: new Error("effort option rejected") });
+
+    const second = await run(failing.execute, stateDir, { sessionParams: first.sessionParams });
+
+    expect(second.exitCode).toBe(1);
+    expect(second.clearSession).toBeFalsy();
+    expect(failing.ensured).toHaveLength(1);
+    expect(await records(stateDir)).toEqual([oldSession]);
+  });
+});

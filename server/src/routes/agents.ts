@@ -4290,7 +4290,7 @@ export function agentRoutes(
       action: "agent.runtime_session_reset",
       entityType: "agent",
       entityId: id,
-      details: { taskKey: taskKey ?? null },
+      details: { taskKey: taskKey ?? null, clearedAcpSessionRecords: state?.clearedAcpSessionRecords ?? 0 },
     });
 
     res.json(state);
