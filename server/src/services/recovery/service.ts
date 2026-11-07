@@ -560,12 +560,22 @@ const INTERACTION_CONTINUATION_REQUEUE_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 // How many times the sweep's recovery runs may hand an issue away and have it
-// come back to the same agent before the sweep blocks it. A hand-over moves
-// the issue on; one that returns it went nowhere.
+// come back to the same agent; the next return blocks the issue. A hand-over
+// that returns the issue went nowhere, unless it closed a review round (the
+// reviewer requests changes, the author fixes and hands it back), which
+// returns it to the reviewer by design.
 const RECOVERY_HANDOVER_MAX_RETURNS = 1;
+// The sweep lanes' recovery retry reasons. A hand-over from any of them
+// counts in every lane, so a loop that moves the issue between lanes (a
+// reassignment that resets it to todo) still counts.
+const RECOVERY_HANDOVER_RETRY_REASONS: ReadonlySet<string> = new Set([
+  "assignment_recovery",
+  "issue_continuation_needed",
+  EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+]);
 // How far back the hand-over chain is read; a loop revisits an agent long
 // before it.
-const RECOVERY_HANDOVER_CHAIN_WINDOW = 20;
+export const RECOVERY_HANDOVER_CHAIN_WINDOW = 20;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
 
@@ -1111,18 +1121,14 @@ export function recoveryService(
 
   // The issue's newest runs that ended by handing it on form a chain, whatever
   // agents ran them; the first run that ended any other way ends it. Counts
-  // the hand-overs in that chain made by one of the lane's recovery runs
-  // (`retryReason`) whose agent held the issue again later, `nextAgentId`
-  // included. A hand-over from an ordinary wake counts as no return but
-  // leaves the chain whole, so a wake in between resets nothing.
+  // the hand-overs in that chain made by a recovery run of any sweep lane
+  // whose agent held the issue again later, `nextAgentId` included. A
+  // hand-over from an ordinary wake counts as no return but leaves the chain
+  // whole, so a wake in between resets nothing.
   async function countRecoveryHandoverReturns(
     companyId: string,
     issueId: string,
     nextAgentId: string,
-    retryReason:
-      | "assignment_recovery"
-      | "issue_continuation_needed"
-      | typeof EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
   ) {
     const rows = await db
       .select({
@@ -1147,7 +1153,13 @@ export function recoveryService(
     for (const row of rows) {
       if (!isConfirmedReassignmentStop(row)) break;
       const rowRetryReason = readNonEmptyString(parseObject(row.contextSnapshot).retryReason);
-      if (rowRetryReason === retryReason && laterHolders.has(row.agentId)) returns += 1;
+      if (
+        rowRetryReason &&
+        RECOVERY_HANDOVER_RETRY_REASONS.has(rowRetryReason) &&
+        laterHolders.has(row.agentId)
+      ) {
+        returns += 1;
+      }
       laterHolders.add(row.agentId);
     }
     return returns;
@@ -1157,12 +1169,11 @@ export function recoveryService(
     issue: { companyId: string; id: string },
     latestRun: LatestIssueRun,
     nextAgentId: string,
-    retryReason: Parameters<typeof countRecoveryHandoverReturns>[3],
   ) {
     return (
       !!latestRun &&
       isConfirmedReassignmentStop(latestRun) &&
-      (await countRecoveryHandoverReturns(issue.companyId, issue.id, nextAgentId, retryReason)) >=
+      (await countRecoveryHandoverReturns(issue.companyId, issue.id, nextAgentId)) >
         RECOVERY_HANDOVER_MAX_RETURNS
     );
   }
@@ -2093,6 +2104,7 @@ export function recoveryService(
         );
       if (
         predecessor &&
+        !isConfirmedReassignmentStop(predecessor) &&
         ["failed", "timed_out", "interrupted", "cancelled"].includes(
           predecessor.status,
         )
@@ -4868,6 +4880,7 @@ export function recoveryService(
       if (
         executionRecoverySource &&
         executionRecoverySource.agentId === agentId &&
+        !isConfirmedReassignmentStop(executionRecoverySource) &&
         ["failed", "timed_out", "interrupted", "cancelled"].includes(
           executionRecoverySource.status,
         )
@@ -5291,12 +5304,7 @@ export function recoveryService(
         }
 
         if (
-          await isRecoveryHandoverLoop(
-            issue,
-            participantLatestRun,
-            participantAgentId,
-            EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
-          )
+          await isRecoveryHandoverLoop(issue, participantLatestRun, participantAgentId)
         ) {
           const updated = await escalateStrandedAssignedIssue({
             issue,
@@ -5445,7 +5453,7 @@ export function recoveryService(
           continue;
         }
 
-        if (await isRecoveryHandoverLoop(issue, latestRun, agentId, "assignment_recovery")) {
+        if (await isRecoveryHandoverLoop(issue, latestRun, agentId)) {
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "todo",
@@ -5735,7 +5743,7 @@ export function recoveryService(
           continue;
         }
 
-        if (await isRecoveryHandoverLoop(issue, latestRun, agentId, "issue_continuation_needed")) {
+        if (await isRecoveryHandoverLoop(issue, latestRun, agentId)) {
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "in_progress",
