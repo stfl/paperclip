@@ -9115,6 +9115,10 @@ describe("ACPX engine dead persistent session record (paperclipai/paperclip#1481
         expect(await records(stateDir)).toEqual([newSession]);
         const replaced = logs.filter((line) => line.includes(oldSession) && line.includes(newSession));
         expect(replaced).toHaveLength(1);
+        expect(logs.filter((line) => line.startsWith("[paperclip]") && line.includes("could not be resumed"))).toEqual(replaced);
+        expect(logs.some((line) => line.includes("failed too"))).toBe(false);
+        // Only one session is called fresh: the one that replaced the record.
+        expect(logs.some((line) => line.includes("retrying with a fresh session"))).toBe(false);
         const freshPrompt = harness.prompts.at(-1)!;
         expect(freshPrompt).toContain("FRESH-SESSION-BOOTSTRAP");
         expect(freshPrompt).toContain("PREVIOUS-RUN-SUMMARY");
@@ -9138,25 +9142,41 @@ describe("ACPX engine dead persistent session record (paperclipai/paperclip#1481
     expect(second.clearSession).toBe(true);
     expect(harness.ensured).toHaveLength(2);
     expect(harness.ensured[1]?.resumeSessionId).toBeUndefined();
-    expect(logs.filter((line) => line.includes(first.sessionParams?.acpSessionId as string)
-      && line.includes("session-2"))).toHaveLength(1);
+    const oldSession = first.sessionParams?.acpSessionId as string;
+    const replaced = logs.filter((line) => line.startsWith("[paperclip]") && line.includes("could not be resumed"));
+    expect(replaced).toHaveLength(1);
+    expect(replaced[0]).toContain(oldSession);
+    expect(replaced[0]).toContain("session-2");
+    const failed = logs.filter((line) => line.includes("failed too"));
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toContain("session-2");
     expect(await records(stateDir)).toEqual([]);
   });
 
-  it("keeps the record and fails the run for a setup failure that is not a dead session", async () => {
+  it.each([
+    ["configure", "effort option rejected"],
+    ["configure", "Resource not found: MCP server tools/list"],
+    ["ensure", "Resource not found: MCP server tools/list"],
+  ] as const)("keeps the record and fails the run for a %s failure that is not a dead session: %s", async (failAt, message) => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const dead = new Set<string>();
-    const ok = deadRecordHarness({ failAt: "configure", dead });
+    const ok = deadRecordHarness({ failAt, dead });
     const first = await run(ok.execute, stateDir, {});
     const oldSession = first.sessionParams?.acpSessionId as string;
-    const failing = deadRecordHarness({ failAt: "configure", dead, otherFailure: new Error("effort option rejected") });
+    const failing = deadRecordHarness({ failAt, dead, otherFailure: new Error(message) });
 
-    const second = await run(failing.execute, stateDir, { sessionParams: first.sessionParams });
+    const logs: string[] = [];
+    const second = await run(failing.execute, stateDir, { sessionParams: first.sessionParams }, logs);
 
     expect(second.exitCode).toBe(1);
-    expect(second.clearSession).toBeFalsy();
-    expect(failing.ensured).toHaveLength(1);
+    // A handshake failure with a resume id still takes Paperclip's own retry
+    // without the resume id, which drops the task session.
+    if (failAt === "configure") {
+      expect(second.clearSession).toBeFalsy();
+      expect(failing.ensured).toHaveLength(1);
+    }
     expect(await records(stateDir)).toEqual([oldSession]);
+    expect(logs.some((line) => line.startsWith("[paperclip]") && line.includes("could not be resumed"))).toBe(false);
   });
 });

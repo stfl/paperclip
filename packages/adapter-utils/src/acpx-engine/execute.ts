@@ -3640,20 +3640,25 @@ async function emitAcpxFailure(input: {
  * acpx's same-session-only resume policy for persistent sessions: the record's
  * session cannot be loaded (its transcript is gone, or a failed setup left a
  * record without one). The class reaches the engine as a thrown error from the
- * handshake or a config call, or as a failed turn result.
+ * handshake or a config call, or as a failed turn result. Its detail code
+ * decides; without one, only acpx's own "could not be resumed" wording does,
+ * since a bare "Resource not found" can be any 404, such as an MCP server's.
  */
 function isSessionResumeRequired(error: unknown): boolean {
-  let current: unknown = error;
-  for (let depth = 0; current && depth < 5; depth += 1) {
-    if (typeof current === "object" && (current as { detailCode?: unknown }).detailCode === "SESSION_RESUME_REQUIRED") return true;
-    const message = current instanceof Error ? current.message
-      : typeof current === "object" && typeof (current as { message?: unknown }).message === "string"
-        ? (current as { message: string }).message
-        : typeof current === "string" ? current : "";
-    if (/could not be resumed|resource not found/i.test(message)) return true;
-    current = typeof current === "object" ? (current as { cause?: unknown }).cause : undefined;
+  const chain: unknown[] = [];
+  for (let current: unknown = error; current && chain.length < 5;
+    current = typeof current === "object" ? (current as { cause?: unknown }).cause : undefined) {
+    chain.push(current);
   }
-  return false;
+  if (chain.some((link) => typeof link === "object" && link !== null
+    && (link as { detailCode?: unknown }).detailCode === "SESSION_RESUME_REQUIRED")) return true;
+  return chain.some((link) => {
+    const message = link instanceof Error ? link.message
+      : typeof link === "object" && link !== null && typeof (link as { message?: unknown }).message === "string"
+        ? (link as { message: string }).message
+        : typeof link === "string" ? link : "";
+    return /persistent acp session \S+ could not be resumed/i.test(message);
+  });
 }
 
 /**
@@ -3663,7 +3668,7 @@ function isSessionResumeRequired(error: unknown): boolean {
  */
 interface AcpxSessionAttempt {
   deadSession: { sessionKey: string; stateDir: string; sessionId: string | null } | null;
-  replacing: { sessionId: string | null; logged?: boolean } | null;
+  replacing: { sessionId: string | null; freshSessionId?: string } | null;
 }
 
 function isResumeFailure(err: unknown): boolean {
@@ -4679,6 +4684,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               });
             } catch (err) {
               if (!resumeSessionId || !isResumeFailure(err)) throw err;
+              // acpx would reuse the dead record by its key; the run discards
+              // it and starts the fresh session instead.
+              if (prepared.mode === "persistent" && isSessionResumeRequired(err)) throw err;
               clearSession = true;
               resumedSession = false;
               await ctx.onLog(
@@ -4845,10 +4853,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         sessionHandle = handle;
         startupFailed = false;
         if (attempt.replacing) {
-          attempt.replacing.logged = true;
+          attempt.replacing.freshSessionId = handle.backendSessionId ?? handle.runtimeSessionName;
           await ctx.onLog(
             "stdout",
-            `[paperclip] ACPX session "${attempt.replacing.sessionId ?? "unknown"}" could not be resumed; this run continues in fresh session "${handle.backendSessionId ?? handle.runtimeSessionName}".\n`,
+            `[paperclip] ACPX session "${attempt.replacing.sessionId ?? "unknown"}" could not be resumed; replaced it with fresh session "${attempt.replacing.freshSessionId}".\n`,
           );
         }
         await emitPhase("ensure_session", ensureSessionPhaseStart, "ok");
@@ -5983,13 +5991,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       runtime: { ...ctx.runtime, sessionId: null, sessionParams: null, sessionDisplayId: null },
     }, fresh);
     if (fresh.deadSession) await discardDeadRecord(fresh.deadSession);
-    if (!fresh.replacing!.logged) {
-      await ctx.onLog(
-        "stdout",
-        `[paperclip] ACPX session "${sessionId ?? "unknown"}" could not be resumed; the fresh session this run started failed too.\n`,
-      );
-    }
     if (freshResult.exitCode === 0) return freshResult;
+    const freshSessionId = fresh.replacing!.freshSessionId;
+    await ctx.onLog(
+      "stdout",
+      freshSessionId
+        ? `[paperclip] ACPX fresh session "${freshSessionId}" failed too; the run fails.\n`
+        : `[paperclip] ACPX session "${sessionId ?? "unknown"}" could not be resumed, and the fresh session this run started failed too.\n`,
+    );
     // The task session named the discarded record; never resume it again.
     return { ...freshResult, clearSession: true };
   };

@@ -309,7 +309,7 @@ describePostgres("runtime session reset removes the ACP engine's session records
     }
     const exists = async (sessionKey: string) =>
       await access(path.join(stateDir, "sessions", `${encodeURIComponent(sessionKey)}.json`)).then(() => true, () => false);
-    return { agentId, issueId, identifier, selected, otherTask, otherAgent, exists };
+    return { agentId, issueId, identifier, selected, otherTask, otherAgent, exists, stateDir };
   }
 
   it.each(["uuid", "identifier"] as const)("removes the selected task's records via its %s and keeps every other record", async (keyKind) => {
@@ -329,5 +329,17 @@ describePostgres("runtime session reset removes the ACP engine's session records
     expect(reset?.clearedAcpSessionRecords).toBe(seeded.selected.length + seeded.otherTask.length);
     for (const sessionKey of [...seeded.selected, ...seeded.otherTask]) expect(await seeded.exists(sessionKey)).toBe(false);
     for (const sessionKey of seeded.otherAgent) expect(await seeded.exists(sessionKey)).toBe(true);
+  });
+
+  it("still resets the task sessions when the engine's records cannot be read", async () => {
+    const seeded = await fixture();
+    await rm(path.join(seeded.stateDir, "sessions"), { recursive: true, force: true });
+    await writeFile(path.join(seeded.stateDir, "sessions"), "not a directory\n");
+    const service = heartbeatService(db);
+    const reset = await service.resetRuntimeSession(seeded.agentId, { taskKey: seeded.issueId });
+    expect(reset?.clearedTaskSessions).toBe(1);
+    expect(reset?.sessionId).toBeNull();
+    expect(reset?.clearedAcpSessionRecords).toBeNull();
+    expect((await service.resetRuntimeSession(seeded.agentId, { taskKey: seeded.issueId }))?.clearedTaskSessions).toBe(0);
   });
 });

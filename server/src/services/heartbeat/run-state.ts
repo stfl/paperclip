@@ -1873,7 +1873,12 @@ export function createHeartbeatRunState(db: Db) {
             }
           : undefined,
       );
-      const clearedAcpSessionRecords = await removeAcpSessionRecords(agent, taskKey);
+      // The task sessions are already gone; a record that cannot be removed
+      // is reported, not a failed reset.
+      const clearedAcpSessionRecords = await removeAcpSessionRecords(agent, taskKey).catch((error: unknown) => {
+        logger.warn({ err: error, agentId: agent.id, taskKey }, "Could not remove the ACP engine's session records on a session reset");
+        return null;
+      });
       const runtimePatch: Partial<typeof agentRuntimeState.$inferInsert> = {
         sessionId: null,
         lastError: null,
