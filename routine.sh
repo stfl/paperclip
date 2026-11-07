@@ -7,6 +7,10 @@ set -euo pipefail
 
 readonly FORK=stfl/paperclip
 readonly UPSTREAM_SLUG=paperclipai/paperclip
+readonly FORK_URL=https://github.com/$FORK
+readonly UPSTREAM_URL=https://github.com/$UPSTREAM_SLUG
+# A push URL no transport accepts, so nothing can push to upstream.
+readonly NO_PUSH=no-push://paperclipai-paperclip-is-read-only
 readonly CI_REPO=stfl/paperclip-ci
 readonly EXIT_CONFLICT=3
 readonly EXIT_STOP=4
@@ -49,7 +53,8 @@ usage: routine.sh [--dry-run] <command> [args]
   summary                   print what this run did
   cleanup                   remove the build worktree and the run state
 
---dry-run (or DRY_RUN=1) prints every push, issue write and dispatch instead.
+--dry-run (or DRY_RUN=1) prints every push, issue write, dispatch and the
+reset of the main clone's master instead.
 Environment: UPSTREAM (remote, path or URL of paperclipai/paperclip),
 CURRENT_NEXT (ref taken as the current stfl-next), NEXT_DIR, STATE_DIR.
 EOF
@@ -224,6 +229,69 @@ push_ref() {
 
 # ---------------------------------------------------------------- setup
 
+is_repo_url() { # <url> <owner/name>
+	case $1 in
+	*[/:]"$2" | *[/:]"$2.git" | *[/:]"$2/") return 0 ;;
+	esac
+	return 1
+}
+
+has_remote() { G remote get-url "$1" >/dev/null 2>&1; }
+
+# A clone of upstream (the cloud attaches both repositories under one name)
+# gets origin = the fork and upstream = paperclipai/paperclip, push disabled.
+fix_remotes() {
+	local url
+	url=$(G remote get-url origin 2>/dev/null || true)
+	is_repo_url "$url" "$FORK" && return 0
+	log "origin is '$url', not $FORK: making it upstream, origin $FORK_URL"
+	if [[ -n $url ]] && ! has_remote upstream; then
+		G remote rename origin upstream
+	else
+		has_remote upstream || G remote add upstream "$UPSTREAM_URL"
+		if [[ -n $url ]]; then G remote remove origin; fi
+	fi
+	G remote set-url upstream "$UPSTREAM_URL"
+	G remote set-url --push upstream "$NO_PUSH"
+	G remote add origin "$FORK_URL"
+}
+
+# Ancestry checks need the whole history: deepen from the remote whose refs
+# hold the shallow boundary, then fetch the other.
+unshallow() {
+	[[ $(G rev-parse --is-shallow-repository) == true ]] || return 0
+	local boundary r from=''
+	boundary=$(head -n1 "$GIT_COMMON/shallow")
+	for r in upstream origin; do
+		has_remote "$r" || continue
+		if [[ -n $(G for-each-ref --count=1 --contains "$boundary" "refs/remotes/$r/") ]]; then
+			from=$r
+			break
+		fi
+	done
+	if [[ -z $from ]]; then
+		from=origin
+		if has_remote upstream; then from=upstream; fi
+	fi
+	log "shallow clone: fetching the full history from $from"
+	G fetch --quiet --unshallow --no-tags "$from"
+	for r in upstream origin; do
+		if [[ $r == "$from" ]] || ! has_remote "$r"; then continue; fi
+		G fetch --quiet --no-tags "$r" "+refs/heads/master:refs/remotes/$r/master"
+	done
+}
+
+# The main clone's master at origin/master, so nothing reads upstream's
+# commits as unpushed work of this clone.
+reset_local_master() {
+	if [[ -n $(git -C "$REPO_TOP" status --porcelain) ]]; then
+		log "$REPO_TOP has local changes: its master stays as it is"
+		return 0
+	fi
+	act git -C "$REPO_TOP" checkout --quiet -B master refs/remotes/origin/master ||
+		log "could not check out master in $REPO_TOP: it stays as it is"
+}
+
 cmd_setup() {
 	rm -rf "$STATE_DIR"
 	mkdir -p "$STATE_DIR"
@@ -242,16 +310,19 @@ cmd_setup() {
 		G config user.name >/dev/null || G config user.name "$BOT_NAME"
 	fi
 
+	fix_remotes
+	unshallow
 	up=$(upstream_source)
 	log "fetching origin and upstream ($up)"
 	G fetch --quiet --no-tags origin \
 		'+refs/heads/master:refs/remotes/origin/master' \
 		'+refs/heads/stfl-next:refs/remotes/origin/stfl-next'
-	G fetch --quiet --no-tags "$up" '+refs/heads/master:refs/remotes/upstream/master'
+	G fetch --quiet --no-tags "$up" '+refs/heads/master:refs/remotes/upstream/master' '+refs/tags/*:refs/tags/*'
+	reset_local_master
 
 	release=$(gh_get "repos/$UPSTREAM_SLUG/releases/latest" --jq .tag_name)
 	[[ $release == v* ]] || die "latest release of $UPSTREAM_SLUG has tag '$release'"
-	G fetch --quiet --no-tags "$up" "+refs/tags/$release:refs/tags/$release"
+	G rev-parse --verify -q "refs/tags/$release^{commit}" >/dev/null || die "upstream has no tag $release"
 	rel=$(G rev-parse "refs/tags/$release^{commit}")
 	if ! is_ancestor "$rel" refs/remotes/upstream/master; then
 		record "STOP: release $release (${rel:0:12}) is not on upstream master: release from a side branch, ask Stefan"

@@ -9,7 +9,7 @@ dotfiles (`docs/paperclip/adr/0002-paperclip-carry-fork.md`).
 `routine.sh` next to this file does every deterministic step. You run it,
 read what it prints, and do the one thing it cannot: port a branch whose merge
 conflicts. Run it as `../meta/routine.sh <command>` from anywhere in the
-`stfl/paperclip` clone.
+clone.
 
 ## Never
 
@@ -26,14 +26,17 @@ conflicts. Run it as `../meta/routine.sh <command>` from anywhere in the
 1. Install pnpm when `pnpm --version` fails: `corepack enable`, or
    `npm i -g pnpm@<version>` with the version of `packageManager` in the
    clone's `package.json`.
-2. The script finds the `paperclipai/paperclip` clone by its `origin` URL
-   among the directories next to the `stfl/paperclip` clone. If it says it
-   cannot, or the fetch from it fails (a shallow clone), set
-   `UPSTREAM=<path of that clone>` or `UPSTREAM=https://github.com/paperclipai/paperclip.git`
-   for every call.
+2. The cloud gives one clone, `/home/user/paperclip`, whose `origin` is
+   `paperclipai/paperclip`, and it is shallow. `setup` turns it into the
+   layout the routine needs: `origin` = `https://github.com/stfl/paperclip`,
+   `upstream` = `https://github.com/paperclipai/paperclip` with a push URL
+   that refuses every push, the full history, upstream's tags, and the clone's
+   `master` at `origin/master`. A clone already laid out so is left as it is.
 
 ## Steps
 
+0. From the clone, put this branch beside it as a detached worktree:
+   `git fetch https://github.com/stfl/paperclip stfl-meta && git worktree add --detach ../meta FETCH_HEAD`.
 1. `routine.sh setup`. It restores the rerere cache from `rr-cache/`, fetches
    both repositories, resolves the latest upstream release and reads the open
    issues. Exit 4 means stop: the release is not on upstream master ("release
