@@ -30,7 +30,7 @@ import * as executionTarget from "@paperclipai/adapter-utils/execution-target";
 import * as runnerProbe from "../vendor/paperclip-runner/index.js";
 import * as nativeCodexRunner from "../services/native-runtime/native-codex-runner.js";
 import { testNativeRunnerAuthentication } from "../services/native-runtime/setup-readiness.js";
-import { prepareManagedAiRuntime, withManagedAiProbe, assertManagedAiProjectAuth, isAiConnectionBusy } from "../services/ai-connection-runtime.js";
+import { prepareManagedAiRuntime, managedAiAdapterRuntime, withManagedAiProbe, assertManagedAiProjectAuth, isAiConnectionBusy } from "../services/ai-connection-runtime.js";
 import { execute as executeGemini, testEnvironment as testGeminiEnvironment } from "@paperclipai/adapter-gemini-local/server";
 import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
@@ -91,6 +91,25 @@ describe("managed AI connections", () => {
         expect(second.home).not.toBe(first.home);
       } finally { await second.cleanup(); }
     } finally { vi.stubEnv("PAPERCLIP_KEPT_AI_SESSION_COMPANIES", ""); }
+  });
+
+  it("hands the adapter the managed home only for a company that keeps sessions", async () => {
+    const userId = "adapter-home-user";
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    await create(userId, "adapter-home-connection");
+    const runInput = { ...input, responsibleUserId: userId, config: { cwd: home } };
+    for (const kept of [companyId, ""]) {
+      vi.stubEnv("PAPERCLIP_KEPT_AI_SESSION_COMPANIES", kept);
+      try {
+        const runtime = await prepareManagedAiRuntime(db, runInput);
+        try {
+          expect(managedAiAdapterRuntime(runtime)).toEqual(kept
+            ? { home: runtime.home, identity: runtime.identity }
+            : undefined);
+        } finally { await runtime.cleanup(); }
+      } finally { vi.stubEnv("PAPERCLIP_KEPT_AI_SESSION_COMPANIES", ""); }
+    }
+    expect(managedAiAdapterRuntime(undefined)).toBeUndefined();
   });
 
   it.each([

@@ -300,6 +300,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       accountOwnerUserId: "task-owner",
       identity: "fixture-grant:task-owner:generation-1",
       home: instructionRoot,
+      sessionStateKept: false,
       cleanup: async () => {},
     };
     const selected = await selectHeartbeatRuntime(db, input);
