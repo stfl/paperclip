@@ -1,19 +1,26 @@
+import { realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   buildLocalProcessSandboxSpawnTarget,
   parseLocalProcessFilesystemScope,
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
   parseLocalProcessSandboxExtraPaths,
+  type LocalProcessSandboxOptions,
 } from "./local-process-sandbox.js";
 import { runChildProcess } from "./server-utils.js";
 
 const cleanup: string[] = [];
+
+// A confined run is refused unless its command lies in the Nix store, so the
+// tests that build one need a Node from there.
+const commandInNixStore = realpathSync(process.execPath).startsWith("/nix/store/");
+const confinable = process.platform === "linux" && commandInNixStore;
 
 async function withTmpDir<T>(tmpDir: string, run: () => Promise<T>): Promise<T> {
   const previousTmpDir = process.env.TMPDIR;
@@ -26,7 +33,12 @@ async function withTmpDir<T>(tmpDir: string, run: () => Promise<T>): Promise<T> 
   }
 }
 
+beforeEach(() => {
+  process.env.PAPERCLIP_SANDBOX_PATHS = JSON.stringify({ read: ["/nix/store"], workspaceRoots: [os.tmpdir()] });
+});
+
 afterEach(async () => {
+  delete process.env.PAPERCLIP_SANDBOX_PATHS;
   await Promise.all(cleanup.splice(0).map((candidate) => fs.rm(candidate, { recursive: true, force: true })));
 });
 
@@ -76,7 +88,7 @@ describe("local process sandbox", () => {
     })).rejects.toThrow("valid networkAllowlist hostname or HTTP(S) networkTrustedUrl");
   });
 
-  it.runIf(process.platform === "linux")("builds a fresh-root bubblewrap command with workspace access", async () => {
+  it.runIf(confinable)("builds a fresh-root bubblewrap command with workspace access", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-sandbox-"));
     cleanup.push(root);
     const workspace = path.join(root, "workspace");
@@ -103,7 +115,7 @@ describe("local process sandbox", () => {
     expect(target.args.slice(-3)).toEqual([process.execPath, "-e", "console.log('ok')"]);
   });
 
-  it.runIf(process.platform === "linux")("binds a confined absolute alias to the synchronized workspace", async () => {
+  it.runIf(confinable)("binds a confined absolute alias to the synchronized workspace", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-alias-"));
     cleanup.push(root);
     const workspace = path.join(root, "workspace");
@@ -159,7 +171,7 @@ describe("local process sandbox", () => {
     expect(target.env?.HTTP_PROXY).toBeUndefined();
   });
 
-  it.runIf(process.platform === "linux")("forwards allowed proxy targets with a deep TMPDIR and rejects other hosts", async () => {
+  it.runIf(confinable)("forwards allowed proxy targets with a deep TMPDIR and rejects other hosts", async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-proxy-"));
     cleanup.push(workspace);
     const deepTmpDir = path.join(workspace, ...Array.from({ length: 6 }, () => "deep-temporary-directory-segment"));
@@ -294,6 +306,30 @@ describe("local process sandbox", () => {
         },
       }),
     ).rejects.toThrow("requires Bubblewrap");
+  });
+
+  it("refuses a sandbox command other than the one the host names", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-sandbox-host-command-"));
+    cleanup.push(workspace);
+    process.env.PAPERCLIP_SANDBOX_BWRAP = path.join(workspace, "host-bwrap");
+    try {
+      await expect(
+        runChildProcess("filesystem-sandbox-host-command", process.execPath, ["-e", "process.exit(0)"], {
+          cwd: workspace,
+          env: {},
+          timeoutSec: 10,
+          graceSec: 1,
+          onLog: async () => {},
+          localProcessSandbox: {
+            workspaceDir: workspace,
+            filesystemScope: "workspace",
+            command: path.join(workspace, "agent-chosen-bwrap"),
+          },
+        }),
+      ).rejects.toThrow("is not the host bubblewrap");
+    } finally {
+      delete process.env.PAPERCLIP_SANDBOX_BWRAP;
+    }
   });
 
   it.runIf(Boolean(process.env.PAPERCLIP_TEST_BWRAP))(
@@ -450,4 +486,137 @@ function request(url) {
       }
     },
   );
+});
+
+describe.runIf(confinable)("local process sandbox on a host with its own sandbox paths", () => {
+  async function hostTree() {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-host-sandbox-")));
+    cleanup.push(root);
+    const dirs = [
+      "proj/c1/p/repo/.git/worktrees/wt", "proj/c1/p/wt", "proj/c2/p/repo/.git/worktrees/wt", "proj/c2/p/wt",
+      "ws/a1", "home", "provider", "kept",
+    ];
+    for (const dir of dirs) await fs.mkdir(path.join(root, dir), { recursive: true });
+    for (const company of ["c1", "c2"]) {
+      const repo = path.join(root, "proj", company, "p", "repo", ".git");
+      await fs.writeFile(path.join(repo, "config"), "[core]\n");
+      await fs.writeFile(path.join(root, "proj", company, "p", "wt", ".git"), `gitdir: ${repo}/worktrees/wt\n`);
+      await fs.writeFile(path.join(repo, "worktrees", "wt", "commondir"), "../..\n");
+      await fs.writeFile(path.join(repo, "worktrees", "wt", "gitdir"), `${root}/proj/${company}/p/wt/.git\n`);
+    }
+    await fs.symlink(path.join(root, "kept"), path.join(root, "provider", "projects"));
+    // A bare mirror the company writes, its ADO refs read-only inside it.
+    await fs.mkdir(path.join(root, "mirror.git", "objects"), { recursive: true });
+    await fs.mkdir(path.join(root, "mirror.git", "refs", "ado"), { recursive: true });
+    await fs.writeFile(path.join(root, "mirror.git", "HEAD"), "ref: refs/heads/main\n");
+    await fs.writeFile(path.join(root, "mirror.git", "config"), "[core]\n");
+    // A detached project repository four levels down in the workspace.
+    const detached = path.join(root, "proj/c1/p/wt/.paperclip-runtime/detached-repositories/d1/.git");
+    await fs.mkdir(detached, { recursive: true });
+    await fs.writeFile(path.join(detached, "config"), "[core]\n");
+    process.env.PAPERCLIP_SANDBOX_PATHS = JSON.stringify({
+      read: ["/nix/store"],
+      write: [],
+      projects: path.join(root, "proj"),
+      workspaces: path.join(root, "ws"),
+      companies: {
+        c1: {
+          write: [path.join(root, "mirror.git")],
+          read: [path.join(root, "mirror.git/refs/ado")],
+          gitRoots: [path.join(root, "mirror.git")],
+        },
+      },
+    });
+    return { root, detached };
+  }
+
+  const input = (root: string, workspaceDir: string, extra: Partial<LocalProcessSandboxOptions> = {}) => ({
+    executable: process.execPath,
+    args: [],
+    cwd: workspaceDir,
+    options: {
+      filesystemScope: "workspace" as const,
+      workspaceDir,
+      companyId: "c1",
+      agentId: "a1",
+      runPaths: [path.join(root, "home")],
+      repoRoots: [path.join(root, "proj/c1/p/repo")],
+      managedPaths: [{ path: path.join(root, "provider"), access: "rw" as const }],
+      ...extra,
+    },
+  });
+
+  async function binds(root: string, workspaceDir: string, extra?: Partial<LocalProcessSandboxOptions>) {
+    const { args } = await buildLocalProcessSandboxSpawnTarget(input(root, workspaceDir, extra));
+    const pairs: string[] = [];
+    args.forEach((arg, index) => {
+      if (arg === "--bind" || arg === "--ro-bind") pairs.push(`${arg} ${args[index + 1]}`);
+    });
+    return pairs;
+  }
+
+  it("binds a worktree's run paths, linked targets, common directory and read-only git metadata", async () => {
+    const { root, detached } = await hostTree();
+    const worktree = await binds(root, path.join(root, "proj/c1/p/wt"));
+    const repo = path.join(root, "proj/c1/p/repo/.git");
+    expect(worktree).toEqual(expect.arrayContaining([
+      `--bind ${root}/proj/c1/p/wt`,
+      `--bind ${repo}`,
+      `--bind ${root}/kept`,
+      `--bind ${root}/home`,
+      `--ro-bind ${root}/proj/c1/p/wt/.git`,
+      `--ro-bind ${repo}/config`,
+      `--ro-bind ${repo}/hooks`,
+      `--ro-bind ${repo}/info`,
+      `--ro-bind ${repo}/worktrees/wt/commondir`,
+      `--ro-bind ${repo}/worktrees/wt/gitdir`,
+    ]));
+    // Of nested host paths the deeper one's access wins, and a gitRoots
+    // repository's metadata is read-only, bound after every read-write bind.
+    const at = (bind: string) => worktree.lastIndexOf(bind);
+    expect(at(`--bind ${root}/mirror.git`)).toBeGreaterThanOrEqual(0);
+    expect(at(`--bind ${root}/mirror.git`)).toBeLessThan(at(`--ro-bind ${root}/mirror.git/refs/ado`));
+    for (const name of ["config", "hooks", "info", "commondir"]) {
+      for (const repository of [`${root}/mirror.git`, detached]) {
+        expect(at(`--ro-bind ${repository}/${name}`)).toBeGreaterThan(at(`--bind ${root}/proj/c1/p/wt`));
+      }
+    }
+  });
+
+  it("binds no common directory for a .git link that points at another workspace's worktree", async () => {
+    const { root } = await hostTree();
+    await fs.writeFile(path.join(root, "ws/a1/.git"), `gitdir: ${root}/proj/c1/p/repo/.git/worktrees/wt\n`);
+    expect(await binds(root, path.join(root, "ws/a1"))).not.toContain(`--bind ${root}/proj/c1/p/repo/.git`);
+  });
+
+  it("refuses a workspace, an extra path or a command outside the company's roots and the Nix store", async () => {
+    const { root } = await hostTree();
+    await expect(buildLocalProcessSandboxSpawnTarget(input(root, path.join(root, "proj/c2/p/wt"))))
+      .rejects.toThrow("Paperclip host refuses the confined run");
+    await expect(buildLocalProcessSandboxSpawnTarget(input(root, path.join(root, "ws/a1"), {
+      extraPaths: [{ path: path.join(root, "proj/c2/p/wt"), access: "ro" }],
+    }))).rejects.toThrow("Paperclip host refuses the confined run");
+    await expect(buildLocalProcessSandboxSpawnTarget({
+      ...input(root, path.join(root, "ws/a1")),
+      executable: path.join(root, "home"),
+    })).rejects.toThrow("not in the Nix store");
+  });
+
+  it("refuses every confined run on a host that names no sandbox paths", async () => {
+    const { root } = await hostTree();
+    delete process.env.PAPERCLIP_SANDBOX_PATHS;
+    await expect(buildLocalProcessSandboxSpawnTarget(input(root, path.join(root, "ws/a1"))))
+      .rejects.toThrow("Paperclip host refuses the confined run");
+  });
+
+  it("binds the sources' realpaths", async () => {
+    const { root } = await hostTree();
+    await fs.mkdir(path.join(root, "ws/a1/real"));
+    await fs.symlink(path.join(root, "ws/a1/real"), path.join(root, "ws/a1/link"));
+    const target = await buildLocalProcessSandboxSpawnTarget(
+      input(root, path.join(root, "ws/a1"), { extraPaths: [{ path: path.join(root, "ws/a1/link"), access: "ro" }] }),
+    );
+    const index = target.args.lastIndexOf(path.join(root, "ws/a1/link"));
+    expect(target.args.slice(index - 2, index + 1)).toEqual(["--ro-bind", path.join(root, "ws/a1/real"), path.join(root, "ws/a1/link")]);
+  });
 });
