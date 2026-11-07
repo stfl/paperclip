@@ -13,6 +13,7 @@ import {
   heartbeatRuns,
   issueRecoveryActions,
   issueComments,
+  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
   projects,
@@ -558,6 +559,29 @@ export function createPostgresRunDispatchAdapter(
     );
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
+    // A card addressed to an agent wakes that agent whether or not it holds
+    // the issue. While the card is pending on this issue, its addressee's run
+    // passes ownership as a comment wake does: it may answer on the issue and
+    // takes nothing over.
+    const interactionId = readNonEmptyString(context.interactionId);
+    const isAddresseeInteractionWake =
+      !isInteractionWake && issue && wakeReason === "interaction_pending" && interactionId &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(interactionId)
+        ? await dbOrTx
+            .select({ id: issueThreadInteractions.id })
+            .from(issueThreadInteractions)
+            .where(
+              and(
+                eq(issueThreadInteractions.id, interactionId),
+                eq(issueThreadInteractions.companyId, input.companyId),
+                eq(issueThreadInteractions.issueId, issue.id),
+                eq(issueThreadInteractions.addresseeAgentId, input.agentId),
+                eq(issueThreadInteractions.status, "pending"),
+              ),
+            )
+            .limit(1)
+            .then((rows) => Boolean(rows[0]))
+        : false;
     const retryReason =
       readNonEmptyString(context.retryReason) ?? input.scheduledRetryReason ?? null;
     const interactionResolvedAt = readNonEmptyString(context.interactionResolvedAt);
@@ -631,7 +655,7 @@ export function createPostgresRunDispatchAdapter(
       isResolvedInteractionContinuation,
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
-      isInteractionWake,
+      isInteractionWake: isInteractionWake || isAddresseeInteractionWake,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
