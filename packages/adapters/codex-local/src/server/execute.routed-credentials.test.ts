@@ -30,7 +30,7 @@ type Routing = { kind: string; protocol: string; baseUrl?: string; auth: string;
 // connection: an isolated provider home outside the Paperclip-managed tree,
 // every inherited credential key blanked, and (for a routed connection) the
 // provider routing in `config.toml` plus `managedAiRouting` in the config.
-async function runManagedConnection(input: { routing: Routing | null; providerKey: string }) {
+async function runManagedConnection(input: { routing: Routing | null; providerKey: string; connection?: boolean }) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-routed-gate-"));
   const paperclipHome = path.join(root, "paperclip-home");
   const hostCodexHome = path.join(root, "host-codex-home");
@@ -73,12 +73,14 @@ async function runManagedConnection(input: { routing: Routing | null; providerKe
         PAPERCLIP_AI_PROVIDER_KEY: input.providerKey,
       },
       ...(input.routing ? { managedAiRouting: input.routing } : {}),
-      managedAiConnection: {
-        provider: "openai",
-        method: "api_key",
-        identity: "grant-1:shared:0000",
-        sessionIdentity: "grant-1:shared:no-auth",
-      },
+      ...(input.connection === false ? {} : {
+        managedAiConnection: {
+          provider: "openai",
+          method: "api_key",
+          identity: "grant-1:shared:0000",
+          sessionIdentity: "grant-1:shared:no-auth",
+        },
+      }),
     },
     context: {},
     onLog: async () => {},
@@ -127,6 +129,18 @@ describe("codex credential gate on a managed AI connection", () => {
     cleanupDirs.push(root);
 
     await expect(run).rejects.toThrow(/no Codex credentials provisioned for managed home/);
+    expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
+  });
+
+  it("keeps the host-credential gate for a routing without a managed connection", async () => {
+    const { root, run } = await runManagedConnection({
+      routing: { kind: "local", protocol: "responses", baseUrl: "http://127.0.0.1:4010/v1", auth: "none", models: [] },
+      providerKey: "",
+      connection: false,
+    });
+    cleanupDirs.push(root);
+
+    await expect(run).rejects.toThrow(/no usable auth\.json and OPENAI_API_KEY is empty/);
     expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
   });
 

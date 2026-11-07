@@ -81,6 +81,7 @@ import {
   isManagedCodexHomePath,
   pathExists,
   prepareManagedCodexHome,
+  readManagedCodexRouting,
   resolveManagedCodexHomeDir,
   resolveSharedCodexHomeDir,
   seedManagedCodexHome,
@@ -374,22 +375,6 @@ async function sandboxCodexAuthJsonExists(input: {
   cwd: string;
 }): Promise<boolean> {
   return (await probeSandboxCodexAuthJson(input)) === "present";
-}
-
-/**
- * The provider routing a managed AI connection projected into this run, read
- * from the config the server built (`managedAiRouting` beside
- * `managedAiConnection`). A routing without a managed connection does not count.
- */
-function readManagedCodexRouting(
-  config: Record<string, unknown>,
-  envConfig: Record<string, unknown>,
-): CodexCredentialReadinessInput["managedRouting"] {
-  if (!config.managedAiConnection) return null;
-  const routing = parseObject(config.managedAiRouting);
-  if (typeof routing.auth !== "string") return null;
-  const providerKey = envConfig.PAPERCLIP_AI_PROVIDER_KEY;
-  return { auth: routing.auth, providerKey: typeof providerKey === "string" ? providerKey : null };
 }
 
 /**
@@ -786,7 +771,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     companyId: agent.companyId,
     configuredCodexHome,
     configuredApiKey: configuredOpenAiApiKey,
-    managedRouting: readManagedCodexRouting(config, envConfig),
+    managedRouting: readManagedCodexRouting(config),
     effectiveCodexHome,
     target: executionTarget,
     cwd,

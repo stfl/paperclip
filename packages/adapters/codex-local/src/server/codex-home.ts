@@ -940,6 +940,26 @@ export interface CodexCredentialReadiness {
 }
 
 /**
+ * The provider routing a managed AI connection projected into a run's config:
+ * `managedAiRouting` beside `managedAiConnection`, with the key from
+ * `env.PAPERCLIP_AI_PROVIDER_KEY`. A routing without a managed connection does
+ * not count.
+ */
+export function readManagedCodexRouting(
+  config: Record<string, unknown>,
+): CodexCredentialReadinessInput["managedRouting"] {
+  if (!config.managedAiConnection) return null;
+  const routing = config.managedAiRouting;
+  if (typeof routing !== "object" || routing === null) return null;
+  const auth = (routing as Record<string, unknown>).auth;
+  if (typeof auth !== "string") return null;
+  const env = config.env;
+  const providerKey =
+    typeof env === "object" && env !== null ? (env as Record<string, unknown>).PAPERCLIP_AI_PROVIDER_KEY : undefined;
+  return { auth, providerKey: typeof providerKey === "string" ? providerKey : null };
+}
+
+/**
  * Read-only predictor for whether a `codex_local` run will be able to
  * authenticate, without seeding or mutating any home. Mirrors the execute-time
  * fail-fast in `execute.ts`, factored out so the control plane can run the same
