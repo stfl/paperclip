@@ -559,6 +559,13 @@ const INTERACTION_CONTINUATION_REQUEUE_MAX_ATTEMPTS = 3;
 
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
+// How many times the sweep's recovery runs may hand an issue away and have it
+// come back to the same agent before the sweep blocks it. A hand-over moves
+// the issue on; one that returns it went nowhere.
+const RECOVERY_HANDOVER_MAX_RETURNS = 1;
+// How far back the hand-over chain is read; a loop revisits an agent long
+// before it.
+const RECOVERY_HANDOVER_CHAIN_WINDOW = 20;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
 
@@ -1102,14 +1109,20 @@ export function recoveryService(
     return { consecutive, latestFinishedAt };
   }
 
-  // How many of the issue's newest runs are continuation hand-overs that
-  // returned it to an agent that had already handed it away, in an unbroken
-  // chain between the assignee and one other agent. A hand-over moves the
-  // issue on; one that hands it back is a retry that went nowhere.
-  async function countContinuationHandoverBounces(
+  // The issue's newest runs that ended by handing it on form a chain, whatever
+  // agents ran them; the first run that ended any other way ends it. Counts
+  // the hand-overs in that chain made by one of the lane's recovery runs
+  // (`retryReason`) whose agent held the issue again later, `nextAgentId`
+  // included. A hand-over from an ordinary wake counts as no return but
+  // leaves the chain whole, so a wake in between resets nothing.
+  async function countRecoveryHandoverReturns(
     companyId: string,
     issueId: string,
-    assigneeAgentId: string,
+    nextAgentId: string,
+    retryReason:
+      | "assignment_recovery"
+      | "issue_continuation_needed"
+      | typeof EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
   ) {
     const rows = await db
       .select({
@@ -1127,20 +1140,42 @@ export function recoveryService(
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
-      .limit(10);
+      .limit(RECOVERY_HANDOVER_CHAIN_WINDOW);
 
-    const first = rows[0];
-    if (!first || first.agentId === assigneeAgentId) return 0;
-    const pair = [first.agentId, assigneeAgentId];
-    let chain = 0;
-    for (const [i, row] of rows.entries()) {
-      if (row.agentId !== pair[i % 2]) break;
+    const laterHolders = new Set([nextAgentId]);
+    let returns = 0;
+    for (const row of rows) {
       if (!isConfirmedReassignmentStop(row)) break;
-      const retryReason = readNonEmptyString(parseObject(row.contextSnapshot).retryReason);
-      if (retryReason !== "issue_continuation_needed") break;
-      chain += 1;
+      const rowRetryReason = readNonEmptyString(parseObject(row.contextSnapshot).retryReason);
+      if (rowRetryReason === retryReason && laterHolders.has(row.agentId)) returns += 1;
+      laterHolders.add(row.agentId);
     }
-    return Math.max(0, chain - 1);
+    return returns;
+  }
+
+  async function isRecoveryHandoverLoop(
+    issue: { companyId: string; id: string },
+    latestRun: LatestIssueRun,
+    nextAgentId: string,
+    retryReason: Parameters<typeof countRecoveryHandoverReturns>[3],
+  ) {
+    return (
+      !!latestRun &&
+      isConfirmedReassignmentStop(latestRun) &&
+      (await countRecoveryHandoverReturns(issue.companyId, issue.id, nextAgentId, retryReason)) >=
+        RECOVERY_HANDOVER_MAX_RETURNS
+    );
+  }
+
+  function handoverLoopNotice(status: "todo" | "in_progress" | "in_review") {
+    return {
+      body:
+        `Paperclip's automatic recovery restarted this assigned \`${status}\` issue, and its agents handed it ` +
+        "on until it came back to an agent that had already handed it away, without finishing. " +
+        "Moving it to `blocked` so it is visible for intervention.",
+      title: "Handed back and forth",
+      tone: "danger" as const,
+    };
   }
 
   async function hasActiveExecutionPath(
@@ -5256,6 +5291,30 @@ export function recoveryService(
         }
 
         if (
+          await isRecoveryHandoverLoop(
+            issue,
+            participantLatestRun,
+            participantAgentId,
+            EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+          )
+        ) {
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_review",
+            latestRun: participantLatestRun,
+            notice: handoverLoopNotice("in_review"),
+            recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+
+        if (
           didAutomaticRecoveryFail(
             participantLatestRun,
             EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
@@ -5383,6 +5442,22 @@ export function recoveryService(
           !(await wasTodoHandedBackDuringOrAfterLatestRun(issue, latestRun))
         ) {
           result.skipped += 1;
+          continue;
+        }
+
+        if (await isRecoveryHandoverLoop(issue, latestRun, agentId, "assignment_recovery")) {
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "todo",
+            latestRun,
+            notice: handoverLoopNotice("todo"),
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
           continue;
         }
 
@@ -5660,24 +5735,12 @@ export function recoveryService(
           continue;
         }
 
-        if (
-          latestRun &&
-          isConfirmedReassignmentStop(latestRun) &&
-          (await countContinuationHandoverBounces(issue.companyId, issue.id, agentId)) >=
-            classification.maxAttempts
-        ) {
+        if (await isRecoveryHandoverLoop(issue, latestRun, agentId, "issue_continuation_needed")) {
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "in_progress",
             latestRun,
-            notice: {
-              body:
-                "Paperclip restarted continuation for this assigned `in_progress` issue, and its agents handed it " +
-                "back and forth between the same two of them without finishing. " +
-                "Moving it to `blocked` so it is visible for intervention.",
-              title: "Handed back and forth",
-              tone: "danger",
-            },
+            notice: handoverLoopNotice("in_progress"),
           });
           if (updated) {
             result.escalated += 1;
