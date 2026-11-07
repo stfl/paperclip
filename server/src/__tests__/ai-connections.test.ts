@@ -74,6 +74,25 @@ beforeAll(async () => {
 afterAll(async () => { await database?.cleanup(); vi.unstubAllEnvs(); if (home) await rm(home, { recursive: true, force: true }); });
 
 describe("managed AI connections", () => {
+  it("keeps Claude transcripts after managed credential cleanup", async () => {
+    const userId = "transcript-user";
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    await create(userId, "transcript-connection");
+    const runInput = { ...input, responsibleUserId: userId, config: { cwd: home } };
+    vi.stubEnv("PAPERCLIP_KEPT_AI_SESSION_COMPANIES", companyId);
+    try {
+      const first = await prepareManagedAiRuntime(db, runInput);
+      await writeFile(path.join(first.home, "provider", "projects", "session.jsonl"), "conversation");
+      await first.cleanup();
+      await expect(access(first.home)).rejects.toMatchObject({ code: "ENOENT" });
+      const second = await prepareManagedAiRuntime(db, runInput);
+      try {
+        expect(await readFile(path.join(second.home, "provider", "projects", "session.jsonl"), "utf8")).toBe("conversation");
+        expect(second.home).not.toBe(first.home);
+      } finally { await second.cleanup(); }
+    } finally { vi.stubEnv("PAPERCLIP_KEPT_AI_SESSION_COMPANIES", ""); }
+  });
+
   it.each([
     { provider: "openrouter", envKey: "OPENROUTER_API_KEY", routed: false },
     { provider: "openrouter", envKey: "OPENROUTER_API_KEY", routed: true },
