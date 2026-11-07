@@ -1464,12 +1464,19 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           finishedAt: cancelled.finishedAt ?? new Date(),
           error: reason,
         });
+        // The run is already cancelled. A lost event must not fail the Stop,
+        // or the mutation that waited on it, nor skip the release below.
         await appendRunEvent(cancelled, {
           eventType: "lifecycle",
           stream: "system",
           level: "warn",
           message: options.eventMessage ?? "run cancelled",
           payload: { ...options.eventPayload, cancellation: readRunCancellation(cancelled.resultJson) },
+        }).catch((eventErr) => {
+          logger.warn(
+            { err: eventErr, runId: cancelled.id },
+            "failed to append run event for cancellation",
+          );
         });
         await releaseIssueExecutionAndPromote(cancelled, {
           suppressImmediateRecovery: options.suppressImmediateRecovery,

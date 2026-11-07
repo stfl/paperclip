@@ -1,6 +1,6 @@
 import { and, asc, eq, getTableColumns, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRunEvents, heartbeatRuns } from "@paperclipai/db";
+import { agents, heartbeatRunEvents, heartbeatRuns } from "@paperclipai/db";
 import { nativeSha256 } from "./native-runtime/canonical.js";
 
 export interface AppendHeartbeatRunEventInput {
@@ -93,6 +93,15 @@ export async function appendHeartbeatRunEvent(
     return { row, disposition: "committed", highestContiguousSourceSeq: 0 };
   }
   return db.transaction(async (tx) => {
+    // The event row's foreign key takes this lock on insert. Taking it before
+    // the run lock gives the order of a writer that locks the agent row and
+    // then writes a row referencing the run, such as an agent file save in
+    // the run's teardown; the reverse order deadlocks with it.
+    await tx
+      .select({ id: agents.id })
+      .from(agents)
+      .where(eq(agents.id, input.agentId))
+      .for("key share");
     const run = await tx
       .select()
       .from(heartbeatRuns)
