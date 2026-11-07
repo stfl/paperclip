@@ -910,7 +910,7 @@ export async function reconcileManagedCodexHome(
   return { status, home: resolved };
 }
 
-export type CodexCredentialAuthMode = "api" | "subscription";
+export type CodexCredentialAuthMode = "api" | "subscription" | "routed";
 
 export interface CodexCredentialReadinessInput {
   env?: NodeJS.ProcessEnv;
@@ -919,6 +919,13 @@ export interface CodexCredentialReadinessInput {
   configuredCodexHome: string | null | undefined;
   /** Resolved `config.env.OPENAI_API_KEY` value (after secret resolution). */
   configuredApiKey: string | null | undefined;
+  /**
+   * Provider routing of a managed AI connection: its `auth` scheme and the key
+   * the routed `model_providers` entry reads from `PAPERCLIP_AI_PROVIDER_KEY`.
+   * A routed provider sets `requires_openai_auth = false`, so it never reads
+   * `auth.json` or `OPENAI_API_KEY`.
+   */
+  managedRouting?: { auth: string; providerKey: string | null | undefined } | null;
 }
 
 export interface CodexCredentialReadiness {
@@ -933,6 +940,26 @@ export interface CodexCredentialReadiness {
 }
 
 /**
+ * The provider routing a managed AI connection projected into a run's config:
+ * `managedAiRouting` beside `managedAiConnection`, with the key from
+ * `env.PAPERCLIP_AI_PROVIDER_KEY`. A routing without a managed connection does
+ * not count.
+ */
+export function readManagedCodexRouting(
+  config: Record<string, unknown>,
+): CodexCredentialReadinessInput["managedRouting"] {
+  if (!config.managedAiConnection) return null;
+  const routing = config.managedAiRouting;
+  if (typeof routing !== "object" || routing === null) return null;
+  const auth = (routing as Record<string, unknown>).auth;
+  if (typeof auth !== "string") return null;
+  const env = config.env;
+  const providerKey =
+    typeof env === "object" && env !== null ? (env as Record<string, unknown>).PAPERCLIP_AI_PROVIDER_KEY : undefined;
+  return { auth, providerKey: typeof providerKey === "string" ? providerKey : null };
+}
+
+/**
  * Read-only predictor for whether a `codex_local` run will be able to
  * authenticate, without seeding or mutating any home. Mirrors the execute-time
  * fail-fast in `execute.ts`, factored out so the control plane can run the same
@@ -942,6 +969,9 @@ export interface CodexCredentialReadiness {
  * - An external/user-supplied `CODEX_HOME` override manages its own auth, so it
  *   is always treated as ready (Paperclip must not seed or inspect it).
  * - A non-empty resolved `OPENAI_API_KEY` means API-key auth, always ready.
+ * - A routed managed AI connection is ready when its route needs no credential
+ *   (`auth: "none"`) or carries a non-empty provider key; a host login does not
+ *   count, because the routed provider never reads it.
  * - Otherwise (subscription mode) the run needs a usable `auth.json`. Because a
  *   managed home symlinks `auth.json` from the shared source home at seed time,
  *   we treat the run as ready when either the (possibly already-seeded) effective
@@ -974,6 +1004,12 @@ export async function evaluateCodexCredentialReadiness(
 
   if (configuredApiKey) {
     return { managed: true, authMode: "api", ready: true, effectiveHome, sharedSourceHome };
+  }
+
+  if (input.managedRouting) {
+    const ready =
+      input.managedRouting.auth === "none" || nonEmpty(input.managedRouting.providerKey ?? undefined) != null;
+    return { managed: true, authMode: "routed", ready, effectiveHome, sharedSourceHome };
   }
 
   const ready =
