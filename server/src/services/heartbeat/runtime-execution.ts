@@ -744,6 +744,10 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       // heartbeat run snapshot.
       const adapterContext: Record<string, unknown> = {
         ...context,
+        // Always replace wake-supplied metadata with this run's trusted home.
+        managedAiRuntime: managedAiRuntime
+          ? { home: managedAiRuntime.home, identity: managedAiRuntime.identity }
+          : undefined,
         ...(legacyQuestionResponse
           ? {
               [PAPERCLIP_WAKE_PAYLOAD_KEY]: {
