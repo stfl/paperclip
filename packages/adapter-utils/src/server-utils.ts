@@ -3525,6 +3525,8 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+const SERVER_GIT_HARDENING_ENV_KEYS = ["GIT_CONFIG_PARAMETERS", "GIT_ATTR_SOURCE"] as const;
+
 export function sanitizeInheritedPaperclipEnv(
   baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
@@ -4752,6 +4754,13 @@ export async function runChildProcess(
     ] as const;
     for (const key of CLAUDE_CODE_NESTING_VARS) {
       delete rawMerged[key];
+    }
+
+    // The server's own git is hardened through these variables (hooks, fsmonitor
+    // and attribute filters off). A run's git is the run's, so it does not
+    // inherit them; a value the adapter sets itself stays.
+    for (const key of SERVER_GIT_HARDENING_ENV_KEYS) {
+      if (process.env[key] && rawMerged[key] === process.env[key]) delete rawMerged[key];
     }
 
     const mergedEnv = ensurePathInEnv(rawMerged);
