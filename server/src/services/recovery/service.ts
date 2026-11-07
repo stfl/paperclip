@@ -1102,6 +1102,47 @@ export function recoveryService(
     return { consecutive, latestFinishedAt };
   }
 
+  // How many of the issue's newest runs are continuation hand-overs that
+  // returned it to an agent that had already handed it away, in an unbroken
+  // chain between the assignee and one other agent. A hand-over moves the
+  // issue on; one that hands it back is a retry that went nowhere.
+  async function countContinuationHandoverBounces(
+    companyId: string,
+    issueId: string,
+    assigneeAgentId: string,
+  ) {
+    const rows = await db
+      .select({
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        resultJson: heartbeatRuns.resultJson,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(10);
+
+    const first = rows[0];
+    if (!first || first.agentId === assigneeAgentId) return 0;
+    const pair = [first.agentId, assigneeAgentId];
+    let chain = 0;
+    for (const [i, row] of rows.entries()) {
+      if (row.agentId !== pair[i % 2]) break;
+      if (!isConfirmedReassignmentStop(row)) break;
+      const retryReason = readNonEmptyString(parseObject(row.contextSnapshot).retryReason);
+      if (retryReason !== "issue_continuation_needed") break;
+      chain += 1;
+    }
+    return Math.max(0, chain - 1);
+  }
+
   async function hasActiveExecutionPath(
     companyId: string,
     issueId: string,
@@ -5607,6 +5648,34 @@ export function recoveryService(
                 `(\`${classification.errorCode}\`). Skipping automatic retries and moving it to \`blocked\` ` +
                 "so it is visible for intervention.",
               title: "Continuation failed",
+              tone: "danger",
+            },
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+
+        if (
+          latestRun &&
+          isConfirmedReassignmentStop(latestRun) &&
+          (await countContinuationHandoverBounces(issue.companyId, issue.id, agentId)) >=
+            classification.maxAttempts
+        ) {
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun,
+            notice: {
+              body:
+                "Paperclip restarted continuation for this assigned `in_progress` issue, and its agents handed it " +
+                "back and forth between the same two of them without finishing. " +
+                "Moving it to `blocked` so it is visible for intervention.",
+              title: "Handed back and forth",
               tone: "danger",
             },
           });

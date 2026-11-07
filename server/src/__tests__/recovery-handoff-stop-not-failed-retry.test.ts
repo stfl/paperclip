@@ -170,16 +170,16 @@ describeEmbeddedPostgres("stranded sweep and in-run hand-overs", () => {
   });
 
   // An in_progress issue handed on from inside continuation runs. Each
-  // entry is the agent of one run, oldest first; the issue ends with B.
+  // entry is the agent of one run, oldest first; the issue ends with C.
   async function seedContinuations(runs: Array<{ agent: "A" | "B" }>) {
-    const { companyId, ids: [a, b] } = await seedCompany(["A", "B"]);
+    const { companyId, ids: [a, b, c] } = await seedCompany(["A", "B", "C"]);
     const issueId = randomUUID();
     await db.insert(issues).values({
       id: issueId,
       companyId,
       title: "Continue the work",
       status: "in_progress",
-      assigneeAgentId: b,
+      assigneeAgentId: c,
       createdAt: new Date(Date.now() - 60 * 60 * 1000),
       updatedAt: new Date(Date.now() - 60 * 60 * 1000),
     });
@@ -199,14 +199,13 @@ describeEmbeddedPostgres("stranded sweep and in-run hand-overs", () => {
         },
       })),
     );
-    return { companyId, issueId, assignee: b };
+    return { companyId, issueId, assignee: c };
   }
 
   it("does not count hand-overs as an in_progress issue's failed continuation retries", async () => {
     const f = await seedContinuations([
       { agent: "A" },
       { agent: "B" },
-      { agent: "A" },
     ]);
     const enqueueWakeup = vi.fn().mockImplementation(async (agentId: string) => {
       const [run] = await db.insert(heartbeatRuns).values({
