@@ -6,6 +6,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issueComments,
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
@@ -112,6 +113,10 @@ describeEmbeddedPostgres("a card's wake for its addressee agent", () => {
     const runId = await queueCardWake(f, f.addressee);
 
     expect(await staleness(f, runId)).toMatchObject({ outcome: "not_stale" });
+    // A busy AI connection retries it as it retries a non-assignee comment
+    // wake, instead of handing it to the issue's holder.
+    const [admitted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(admitted?.runnerProfileJson).toMatchObject({ aiConnectionNonAssigneeCommentWake: true });
 
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, runId));
     for (const kind of ["comment", "interaction_resolution"] as const) {
@@ -151,5 +156,118 @@ describeEmbeddedPostgres("a card's wake for its addressee agent", () => {
       outcome: "cancelled",
       errorCode: "issue_assignee_changed",
     });
+  });
+
+  async function insertCard(
+    values: Partial<typeof issueThreadInteractions.$inferInsert> & {
+      companyId: string;
+      issueId: string;
+    },
+  ) {
+    const id = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id,
+      kind: "ask_user_questions",
+      status: "pending",
+      payload: { version: 1, questions: [] },
+      ...values,
+    } as typeof issueThreadInteractions.$inferInsert);
+    return id;
+  }
+
+  it("admits the addressee's run for a card the board created", async () => {
+    const f = await seedCard();
+    const interactionId = await insertCard({
+      companyId: f.companyId,
+      issueId: f.issueId,
+      createdByAgentId: null,
+      createdByUserId: "board-user",
+      addresseeAgentId: f.addressee,
+    });
+    const runId = await queueCardWake({ ...f, interactionId }, f.addressee);
+
+    expect(await staleness(f, runId)).toMatchObject({ outcome: "not_stale" });
+  });
+
+  it("cancels the addressee's run when the card it names is on another issue", async () => {
+    const f = await seedCard();
+    const otherIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: otherIssueId,
+      companyId: f.companyId,
+      title: "Another issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: f.assignee,
+    });
+    const interactionId = await insertCard({
+      companyId: f.companyId,
+      issueId: otherIssueId,
+      createdByAgentId: f.assignee,
+      addresseeAgentId: f.addressee,
+    });
+    const runId = await queueCardWake({ ...f, interactionId }, f.addressee);
+
+    expect(await staleness(f, runId)).toMatchObject({
+      outcome: "cancelled",
+      errorCode: "issue_assignee_changed",
+    });
+  });
+
+  it("cancels the addressee's run when the card it names belongs to another company", async () => {
+    const f = await seedCard();
+    const other = await seedCard();
+    const runId = await queueCardWake({ ...f, interactionId: other.interactionId }, f.addressee);
+
+    expect(await staleness(f, runId)).toMatchObject({
+      outcome: "cancelled",
+      errorCode: "issue_assignee_changed",
+    });
+  });
+
+  // Agents trading cards on one issue: `earlier` agent cards before the one
+  // the wake names, all later than any human turn.
+  async function seedTradedCards(earlier: number) {
+    const f = await seedCard();
+    const base = Date.now() - 60 * 60_000;
+    for (let i = 0; i < earlier; i += 1) {
+      await insertCard({
+        companyId: f.companyId,
+        issueId: f.issueId,
+        status: "answered",
+        createdByAgentId: i % 2 === 0 ? f.assignee : f.addressee,
+        addresseeAgentId: i % 2 === 0 ? f.addressee : f.assignee,
+        createdAt: new Date(base + i * 60_000),
+      });
+    }
+    await db
+      .update(issueThreadInteractions)
+      .set({ createdAt: new Date(base + earlier * 60_000 + 30_000) })
+      .where(eq(issueThreadInteractions.id, f.interactionId));
+    return { ...f, base };
+  }
+
+  it("cancels the addressee's run once agents have traded too many cards since the last human turn", async () => {
+    const f = await seedTradedCards(10);
+    const runId = await queueCardWake(f, f.addressee);
+
+    expect(await staleness(f, runId)).toMatchObject({
+      outcome: "cancelled",
+      errorCode: "issue_assignee_changed",
+    });
+  });
+
+  it("admits the addressee's run again after a human comments on the issue", async () => {
+    const f = await seedTradedCards(10);
+    await db.insert(issueComments).values({
+      companyId: f.companyId,
+      issueId: f.issueId,
+      authorUserId: "board-user",
+      body: "Carry on.",
+      createdAt: new Date(f.base + 9 * 60_000 + 30_000),
+    });
+    const runId = await queueCardWake(f, f.addressee);
+
+    expect(await staleness(f, runId)).toMatchObject({ outcome: "not_stale" });
   });
 });
