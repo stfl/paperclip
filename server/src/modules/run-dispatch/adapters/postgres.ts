@@ -2,7 +2,7 @@ import { hasConversationContinuationPolicy } from "../../../services/conversatio
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { validateReconstructedWorkspaceDispatch } from "../../../services/native-runtime/native-workspace-reconstruction.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
-import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -576,6 +576,12 @@ export function createPostgresRunDispatchAdapter(
                 eq(issueThreadInteractions.companyId, input.companyId),
                 eq(issueThreadInteractions.issueId, issue.id),
                 eq(issueThreadInteractions.addresseeAgentId, input.agentId),
+                // A card an agent addresses to itself is a note, no question
+                // to another agent: it gives the agent no run on the issue.
+                or(
+                  isNull(issueThreadInteractions.createdByAgentId),
+                  ne(issueThreadInteractions.createdByAgentId, input.agentId),
+                ),
                 eq(issueThreadInteractions.status, "pending"),
               ),
             )
