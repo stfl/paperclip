@@ -470,6 +470,21 @@ function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
   return null;
 }
 
+// A run its agent stopped by handing the issue on (a confirmed
+// `issue_reassigned` stop) ended as asked, so it is no failed retry of the
+// issue's recovery and no attempt toward a retry cap.
+function isConfirmedReassignmentStop(run: {
+  status: string;
+  errorCode?: string | null;
+  resultJson?: unknown;
+}) {
+  return (
+    run.status === "cancelled" &&
+    run.errorCode === "issue_reassigned" &&
+    parseObject(run.resultJson).reassignmentStopConfirmed === true
+  );
+}
+
 function didAutomaticRecoveryFail(
   latestRun: LatestIssueRun,
   expectedRetryReason:
@@ -478,6 +493,7 @@ function didAutomaticRecoveryFail(
     | typeof EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
 ) {
   if (!latestRun) return false;
+  if (isConfirmedReassignmentStop(latestRun)) return false;
 
   const latestContext = parseObject(latestRun.contextSnapshot);
   const latestRetryReason = readNonEmptyString(latestContext.retryReason);
@@ -1038,6 +1054,7 @@ export function recoveryService(
         status: heartbeatRuns.status,
         errorCode: heartbeatRuns.errorCode,
         contextSnapshot: heartbeatRuns.contextSnapshot,
+        resultJson: heartbeatRuns.resultJson,
         finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
@@ -1065,6 +1082,7 @@ export function recoveryService(
       const ctx = parseObject(row.contextSnapshot);
       const retryReason = readNonEmptyString(ctx.retryReason);
       if (retryReason !== "issue_continuation_needed") break;
+      if (isConfirmedReassignmentStop(row)) break;
       if (
         !UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
           row.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
