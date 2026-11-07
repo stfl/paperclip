@@ -910,7 +910,7 @@ export async function reconcileManagedCodexHome(
   return { status, home: resolved };
 }
 
-export type CodexCredentialAuthMode = "api" | "subscription";
+export type CodexCredentialAuthMode = "api" | "subscription" | "routed";
 
 export interface CodexCredentialReadinessInput {
   env?: NodeJS.ProcessEnv;
@@ -919,6 +919,13 @@ export interface CodexCredentialReadinessInput {
   configuredCodexHome: string | null | undefined;
   /** Resolved `config.env.OPENAI_API_KEY` value (after secret resolution). */
   configuredApiKey: string | null | undefined;
+  /**
+   * Provider routing of a managed AI connection: its `auth` scheme and the key
+   * the routed `model_providers` entry reads from `PAPERCLIP_AI_PROVIDER_KEY`.
+   * A routed provider sets `requires_openai_auth = false`, so it never reads
+   * `auth.json` or `OPENAI_API_KEY`.
+   */
+  managedRouting?: { auth: string; providerKey: string | null | undefined } | null;
 }
 
 export interface CodexCredentialReadiness {
@@ -942,6 +949,9 @@ export interface CodexCredentialReadiness {
  * - An external/user-supplied `CODEX_HOME` override manages its own auth, so it
  *   is always treated as ready (Paperclip must not seed or inspect it).
  * - A non-empty resolved `OPENAI_API_KEY` means API-key auth, always ready.
+ * - A routed managed AI connection is ready when its route needs no credential
+ *   (`auth: "none"`) or carries a non-empty provider key; a host login does not
+ *   count, because the routed provider never reads it.
  * - Otherwise (subscription mode) the run needs a usable `auth.json`. Because a
  *   managed home symlinks `auth.json` from the shared source home at seed time,
  *   we treat the run as ready when either the (possibly already-seeded) effective
@@ -974,6 +984,12 @@ export async function evaluateCodexCredentialReadiness(
 
   if (configuredApiKey) {
     return { managed: true, authMode: "api", ready: true, effectiveHome, sharedSourceHome };
+  }
+
+  if (input.managedRouting) {
+    const ready =
+      input.managedRouting.auth === "none" || nonEmpty(input.managedRouting.providerKey ?? undefined) != null;
+    return { managed: true, authMode: "routed", ready, effectiveHome, sharedSourceHome };
   }
 
   const ready =
