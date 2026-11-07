@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -10,12 +10,21 @@ import {
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
-import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import { renderPaperclipWakePrompt, encodePaperclipWakeData } from "@paperclipai/adapter-utils/server-utils";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
 import { StaleExecutionContinuationError, buildExecutionContinuation, currentContinuationOrigins, projectHumanInteractionResponse } from "./execution-continuation.js";
+
+const MAX_CONTINUATION_COMMENTS = 40;
+const MAX_CONTINUATION_COMMENT_BODY_CHARS = 4_000;
+const MAX_CONTINUATION_COMMENT_BODY_ENCODED_BYTES = 24_000;
+const MAX_CONTINUATION_OBJECTIVE_ENCODED_BYTES = 16_000;
+const MAX_WAKE_PROMPT_BYTES = 128 * 1024;
+
+const encodedBytes = (value: string): number =>
+  Buffer.byteLength(encodePaperclipWakeData(value).slice(1, -1));
 
 const expectStaleContinuation = async (
   run: () => Promise<unknown>,
@@ -437,6 +446,302 @@ const support = await getEmbeddedPostgresTestSupport();
           }),
         "continuation_task_ownership_changed",
       );
+    });
+
+    it("bounds the continuation payload when a task accumulated many comments", async () => {
+      const commentIds = Array.from({ length: 300 }, () => randomUUID());
+      const body = "context ".repeat(200);
+      const createdAtBase = Date.UTC(2026, 11, 1, 0, 0, 0);
+      for (let offset = 0; offset < commentIds.length; offset += 100) {
+        await db.insert(issueComments).values(
+          commentIds.slice(offset, offset + 100).map((id, index) => ({
+            id,
+            companyId,
+            issueId,
+            authorType: "user" as const,
+            authorUserId: "local-board",
+            body:
+              offset + index === commentIds.length - 1
+                ? "latest ".repeat(1_500)
+                : `${offset + index} ${body}`,
+            createdAt: new Date(createdAtBase + (offset + index) * 1000),
+          })),
+        );
+      }
+      try {
+        const envelope = await build();
+        const totalBodyChars = envelope.messages.reduce(
+          (sum, message) => sum + message.body.length,
+          0,
+        );
+        const totalBodyEncodedBytes = envelope.messages.reduce(
+          (sum, message) => sum + encodedBytes(message.body),
+          0,
+        );
+        expect(envelope.messages.length).toBeLessThanOrEqual(
+          MAX_CONTINUATION_COMMENTS,
+        );
+        expect(totalBodyChars).toBeLessThanOrEqual(
+          MAX_CONTINUATION_COMMENT_BODY_ENCODED_BYTES,
+        );
+        expect(totalBodyEncodedBytes).toBeLessThanOrEqual(
+          MAX_CONTINUATION_COMMENT_BODY_ENCODED_BYTES,
+        );
+        for (const message of envelope.messages) {
+          expect(message.body.length).toBeLessThanOrEqual(
+            MAX_CONTINUATION_COMMENT_BODY_CHARS,
+          );
+        }
+        expect(envelope.messages.at(-1)?.id).toBe(commentIds.at(-1));
+        expect(envelope.messages.map((message) => message.id)).toContain(gmailId);
+        const prompt = renderPaperclipWakePrompt(
+          { executionContinuation: envelope },
+          { resumedSession: false },
+        );
+        expect(Buffer.byteLength(prompt)).toBeLessThan(MAX_WAKE_PROMPT_BYTES);
+      } finally {
+        await db
+          .delete(issueComments)
+          .where(inArray(issueComments.id, commentIds));
+      }
+    });
+
+    it("caps the origin set and the message list when the accumulated origins exceed the window", async () => {
+      const commentIds = Array.from({ length: 120 }, () => randomUUID());
+      const createdAtBase = Date.UTC(2026, 11, 2, 0, 0, 0);
+      await db.insert(issueComments).values(
+        commentIds.map((id, index) => ({
+          id,
+          companyId,
+          issueId,
+          authorType: "user" as const,
+          authorUserId: "local-board",
+          body: `origin ${index} ` + "context ".repeat(60),
+          createdAt: new Date(createdAtBase + index * 1000),
+        })),
+      );
+      try {
+        const envelope = await buildExecutionContinuation({
+          db,
+          companyId,
+          issueId,
+          agentId,
+          context: {
+            wakeReason: "issue_commented",
+            executionContinuation: { originCommentIds: commentIds },
+          },
+          summary: null,
+          exposeLowTrustRaw: false,
+        });
+        expect(envelope.originCommentIds.length).toBeLessThanOrEqual(
+          MAX_CONTINUATION_COMMENTS,
+        );
+        expect(envelope.messages.length).toBeLessThanOrEqual(
+          MAX_CONTINUATION_COMMENTS,
+        );
+        const prompt = renderPaperclipWakePrompt(
+          { executionContinuation: envelope },
+          { resumedSession: false },
+        );
+        expect(Buffer.byteLength(prompt)).toBeLessThan(MAX_WAKE_PROMPT_BYTES);
+      } finally {
+        await db
+          .delete(issueComments)
+          .where(inArray(issueComments.id, commentIds));
+      }
+    });
+
+    it("keeps the rendered prompt under the argument limit when the comment text is escape heavy", async () => {
+      const commentIds = Array.from({ length: 60 }, () => randomUUID());
+      const createdAtBase = Date.UTC(2026, 11, 3, 0, 0, 0);
+      await db.insert(issueComments).values(
+        commentIds.map((id, index) => ({
+          id,
+          companyId,
+          issueId,
+          authorType: "user" as const,
+          authorUserId: "local-board",
+          body: "<".repeat(4_000),
+          createdAt: new Date(createdAtBase + index * 1000),
+        })),
+      );
+      try {
+        const envelope = await build();
+        const totalBodyEncodedBytes = envelope.messages.reduce(
+          (sum, message) => sum + encodedBytes(message.body),
+          0,
+        );
+        expect(totalBodyEncodedBytes).toBeLessThanOrEqual(
+          MAX_CONTINUATION_COMMENT_BODY_ENCODED_BYTES,
+        );
+        for (const message of envelope.messages) {
+          expect(message.body.length).toBeLessThanOrEqual(
+            MAX_CONTINUATION_COMMENT_BODY_CHARS,
+          );
+        }
+        const prompt = renderPaperclipWakePrompt(
+          { executionContinuation: envelope },
+          { resumedSession: false },
+        );
+        expect(Buffer.byteLength(prompt)).toBeLessThan(MAX_WAKE_PROMPT_BYTES);
+      } finally {
+        await db
+          .delete(issueComments)
+          .where(inArray(issueComments.id, commentIds));
+      }
+    });
+
+    it("keeps the current user request as the objective when it falls outside the comment window", async () => {
+      const requestId = randomUUID();
+      const progressIds = Array.from({ length: 45 }, () => randomUUID());
+      await db.insert(issueComments).values([
+        {
+          id: requestId,
+          companyId,
+          issueId,
+          authorType: "user" as const,
+          authorUserId: "local-board",
+          body: "Ship the release notes today.",
+          createdAt: new Date(Date.UTC(2026, 11, 4, 0, 0, 0)),
+        },
+        ...progressIds.map((id, index) => ({
+          id,
+          companyId,
+          issueId,
+          authorType: "agent" as const,
+          authorAgentId: agentId,
+          body: `progress ${index}`,
+          createdAt: new Date(Date.UTC(2026, 11, 5, 0, 0, 0) + index * 1000),
+        })),
+      ]);
+      try {
+        const envelope = await build();
+        expect(envelope.objective).toBe("Ship the release notes today.");
+        expect(envelope.objectiveSource).toMatchObject({
+          kind: "comment",
+          id: requestId,
+        });
+        expect(encodedBytes(envelope.objective)).toBeLessThanOrEqual(
+          MAX_CONTINUATION_OBJECTIVE_ENCODED_BYTES,
+        );
+        expect(
+          envelope.messages.some((message) => message.id === requestId),
+        ).toBe(false);
+      } finally {
+        await db
+          .delete(issueComments)
+          .where(inArray(issueComments.id, [requestId, ...progressIds]));
+      }
+    });
+  it("keeps a request from a comment without an author type as the objective", async () => {
+      const legacyRequestId = randomUUID();
+      await db.insert(issueComments).values({
+        id: legacyRequestId,
+        companyId,
+        issueId,
+        authorUserId: "local-board",
+        body: "Ship the release notes today.",
+        createdAt: new Date(Date.UTC(2026, 11, 6, 0, 0, 0)),
+      });
+      try {
+        const envelope = await build();
+        expect(envelope.objective).toBe("Ship the release notes today.");
+        expect(envelope.objectiveSource).toMatchObject({
+          kind: "comment",
+          id: legacyRequestId,
+        });
+      } finally {
+        await db
+          .delete(issueComments)
+          .where(eq(issueComments.id, legacyRequestId));
+      }
+    });
+
+    it("says the history is truncated when the window holds less than the thread", async () => {
+      const full = await build();
+      expect(full.coverage.kind).toBe("full_task_history");
+      expect(full.coverage.omittedCount).toBeUndefined();
+      const commentIds = Array.from({ length: 60 }, () => randomUUID());
+      await db.insert(issueComments).values(
+        commentIds.map((id, index) => ({
+          id,
+          companyId,
+          issueId,
+          authorType: "agent" as const,
+          authorAgentId: agentId,
+          body: `progress ${index}`,
+          createdAt: new Date(Date.UTC(2026, 11, 7, 0, 0, 0) + index * 1000),
+        })),
+      );
+      try {
+        const envelope = await build();
+        expect(envelope.coverage.kind).toBe("truncated_task_history");
+        expect(envelope.coverage.omittedCount).toBe(
+          3 + commentIds.length - envelope.messages.length,
+        );
+        const prompt = renderPaperclipWakePrompt(
+          { executionContinuation: envelope },
+          { resumedSession: false },
+        );
+        expect(prompt).toContain("History was truncated to fit the wake payload");
+        expect(prompt).not.toContain("History is complete through the coverage cursor");
+      } finally {
+        await db
+          .delete(issueComments)
+          .where(inArray(issueComments.id, commentIds));
+      }
+    });
+
+    it("says the history is truncated when a comment is cut to its budget", async () => {
+      const longId = randomUUID();
+      await db.insert(issueComments).values({
+        id: longId,
+        companyId,
+        issueId,
+        authorType: "agent" as const,
+        authorAgentId: agentId,
+        body: "x".repeat(MAX_CONTINUATION_COMMENT_BODY_CHARS + 1),
+        createdAt: new Date(Date.UTC(2026, 11, 8, 0, 0, 0)),
+      });
+      try {
+        const envelope = await build();
+        expect(envelope.messages.find((message) => message.id === longId)?.body.length)
+          .toBe(MAX_CONTINUATION_COMMENT_BODY_CHARS);
+        expect(envelope.coverage.kind).toBe("truncated_task_history");
+        expect(envelope.coverage.omittedCount).toBe(0);
+      } finally {
+        await db.delete(issueComments).where(eq(issueComments.id, longId));
+      }
+    });
+
+    it("bounds the description the objective falls back to", async () => {
+      const bareIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: bareIssueId,
+        companyId,
+        title: "A long brief",
+        description: "<".repeat(100_000),
+        status: "in_progress",
+        assigneeAgentId: agentId,
+      });
+      try {
+        const envelope = await buildExecutionContinuation({
+          db,
+          companyId,
+          issueId: bareIssueId,
+          agentId,
+          context: { wakeReason: "issue_assigned" },
+          summary: null,
+          exposeLowTrustRaw: false,
+        });
+        expect(envelope.objectiveSource?.kind).toBe("description");
+        expect(envelope.objective.length).toBeGreaterThan(0);
+        expect(encodedBytes(envelope.objective)).toBeLessThanOrEqual(
+          MAX_CONTINUATION_OBJECTIVE_ENCODED_BYTES,
+        );
+      } finally {
+        await db.delete(issues).where(eq(issues.id, bareIssueId));
+      }
     });
   },
 );
