@@ -1124,6 +1124,96 @@ describe("agent permission routes", () => {
     expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
   });
 
+  describe("sandbox settings are the board's", () => {
+    const peerKey = {
+      type: "agent",
+      agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    };
+    const sandboxed = { engine: "cli", filesystemScope: "workspace", filesystemExtraPaths: ["/srv/cache"] };
+
+    it.each(["filesystemScope", "networkScope", "filesystemExtraPaths"])(
+      "blocks an agent key from setting %s on a peer",
+      async (key) => {
+        mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "codex_local" });
+        const app = await createApp(peerKey);
+        const res = await requestApp(app, (baseUrl) => request(baseUrl)
+          .patch(`/api/agents/${agentId}`)
+          .send({ adapterConfig: { [key]: key === "filesystemExtraPaths" ? ["/srv"] : "workspace" } }));
+
+        expect(res.status).toBe(403);
+        expect(res.body.error).toContain("Only the board can change the sandbox settings of an agent");
+        expect(mockAgentService.update).not.toHaveBeenCalled();
+      },
+    );
+
+    it("blocks an agent key from removing a peer's sandbox settings by replacing its configuration", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "codex_local", adapterConfig: sandboxed });
+      const app = await createApp(peerKey);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ replaceAdapterConfig: true, adapterConfig: { engine: "cli" } }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("Only the board can change the sandbox settings of an agent");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("blocks an agent key from moving a peer with sandbox settings to another adapter", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "codex_local", adapterConfig: sandboxed });
+      const app = await createApp(peerKey);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterType: "claude_local", adapterConfig: { engine: "cli", ...sandboxed } }));
+
+      expect(res.status).toBe(403);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["create", `/api/companies/${companyId}/agents`],
+      ["hire", `/api/companies/${companyId}/agent-hires`],
+    ])("blocks an agent key from creating an agent with sandbox settings on %s", async (_label, path) => {
+      const app = await createApp({ type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" });
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(path)
+        .send({ name: "Scoped peer", role: "engineer", adapterType: "codex_local", adapterConfig: sandboxed }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("Only the board can change the sandbox settings of an agent");
+      expect(mockAgentService.create).not.toHaveBeenCalled();
+    });
+
+    it("blocks an agent key from rolling a peer back into a revision with sandbox settings", async () => {
+      const revisionId = "33333333-3333-4333-8333-333333333333";
+      mockAgentService.getConfigRevision.mockResolvedValue({
+        id: revisionId,
+        afterConfig: { adapterType: "codex_local", adapterConfig: sandboxed, runtimeConfig: {} },
+      });
+      const app = await createApp(peerKey);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${agentId}/config-revisions/${revisionId}/rollback`));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("Only the board can change the sandbox settings of an agent");
+      expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+    });
+
+    it("refuses sandbox settings on an adapter that would ignore them, for the board too", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "process" });
+      const app = await createApp({ type: "board", userId: "user-1", source: "session", isInstanceAdmin: true, companyIds: [companyId] });
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { filesystemScope: "workspace" } }));
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain("does not enforce sandbox settings");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+  });
+
   it.each(["provisionCommand", "runtimeProvisionCommand", "teardownCommand"])(
     "blocks agent-authenticated rollback of workspace %s",
     async (commandKey) => {
