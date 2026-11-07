@@ -16,15 +16,17 @@ describe("managed AI transcript storage", () => {
       root = await mkdtemp(path.join(os.tmpdir(), "managed-ai-state-test-"));
       vi.stubEnv("PAPERCLIP_HOME", root);
       vi.stubEnv("PAPERCLIP_KEPT_AI_SESSION_COMPANIES", "company, other");
+      const linked = new Map<string, boolean>();
       const scope = { companyId: "company", agentId: "agent", grantId: "grant", responsibleUserId: "user", harness };
       async function prepare(overrides = {}) {
         const home = await mkdtemp(path.join(root, "run-"));
         await mkdir(path.join(home, "provider"));
         await writeFile(path.join(home, "provider", "auth.json"), "secret");
-        await linkManagedAiSessionState({ ...scope, ...overrides, home });
+        linked.set(home, await linkManagedAiSessionState({ ...scope, ...overrides, home }));
         return home;
       }
       const first = await prepare();
+      expect(linked.get(first)).toBe(true);
       const state = path.join(first, "provider", directory);
       const persistent = await realpath(state);
       await writeFile(path.join(state, "session.jsonl"), "conversation");
@@ -41,9 +43,11 @@ describe("managed AI transcript storage", () => {
       }
       const unlisted = await prepare({ companyId: "unlisted" });
       await expect(readdir(path.join(unlisted, "provider", directory))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(linked.get(unlisted)).toBe(false);
       // A probe for an agent that does not exist yet has no scope of its own.
       const probe = await prepare({ agentId: "" });
       await expect(readdir(path.join(probe, "provider", directory))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(linked.get(probe)).toBe(false);
       // Concurrent runs share transcripts but never the credential home.
       const concurrent = await prepare();
       expect(concurrent).not.toBe(second);

@@ -311,7 +311,7 @@ export async function prepareManagedAiRuntime(
     );
     const providerHome = path.join(home, "provider");
     await mkdir(providerHome, { mode: 0o700 });
-    await linkManagedAiSessionState({
+    const sessionStateKept = await linkManagedAiSessionState({
       home,
       companyId: input.companyId,
       agentId: input.agentId,
@@ -411,6 +411,7 @@ export async function prepareManagedAiRuntime(
       accountOwnerUserId: selection.grant.subjectUserId,
       identity,
       home,
+      sessionStateKept,
       cleanup: async () => {
         if (subscriptionFile) {
           const refreshed = await readFile(authFile, "utf8");
@@ -497,6 +498,17 @@ export async function prepareManagedAiRuntime(
     if (home) await rm(home, { recursive: true, force: true });
     throw error;
   }
+}
+
+/**
+ * The managed home an adapter may treat as one session across runs. A home
+ * whose transcripts the run's end deletes must keep the per-run session key,
+ * or the next run resumes a session record whose transcript is gone.
+ */
+export function managedAiAdapterRuntime(
+  runtime: Pick<Awaited<ReturnType<typeof prepareManagedAiRuntime>>, "home" | "identity" | "sessionStateKept"> | undefined,
+): { home: string; identity: string } | undefined {
+  return runtime?.sessionStateKept ? { home: runtime.home, identity: runtime.identity } : undefined;
 }
 
 /** Manual tests/adoption have no heartbeat row for quota's active-run guard.
