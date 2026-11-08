@@ -643,6 +643,56 @@ export async function stageCodexHomeForSync(
   }
 }
 
+const KEPT_SESSION_DIRECTORIES = ["sessions", "archived_sessions"] as const;
+
+/**
+ * Codex resumes a thread only from the rollouts under its own `CODEX_HOME`.
+ * A generated launch home therefore takes over the transcript links of the
+ * credential home it seeds from, but only links into this company's kept
+ * sessions under the instance's `managed-ai-sessions/`, so a caller-owned
+ * home's own layout never leaks into a generated one. A real directory already
+ * in the launch home is left alone.
+ */
+export async function linkKeptCodexSessionState(
+  credentialHome: string,
+  launchHome: string,
+  env: NodeJS.ProcessEnv,
+  companyId: string,
+): Promise<void> {
+  const instanceRoot = resolvePaperclipInstanceRootForAdapter({
+    homeDir: nonEmpty(env.PAPERCLIP_HOME) ?? undefined,
+    instanceId: nonEmpty(env.PAPERCLIP_INSTANCE_ID) ?? undefined,
+    env,
+  });
+  const keptRoot = await fs.realpath(path.resolve(instanceRoot, "managed-ai-sessions", companyId)).catch(() => null);
+  if (!keptRoot) return;
+  for (const name of KEPT_SESSION_DIRECTORIES) {
+    const credentialPath = path.join(credentialHome, name);
+    if (!(await fs.lstat(credentialPath).catch(() => null))?.isSymbolicLink()) continue;
+    const target = await fs.realpath(credentialPath).catch(() => null);
+    if (!target?.startsWith(keptRoot + path.sep)) continue;
+    await ensureDirectoryLink(path.join(launchHome, name), target);
+  }
+}
+
+/** Concurrent runs may race on one launch home; whichever link lands first wins if it agrees. */
+async function ensureDirectoryLink(linkPath: string, target: string): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const existing = await fs.lstat(linkPath).catch(() => null);
+    if (existing && !existing.isSymbolicLink()) return;
+    if (existing) {
+      if (await fs.realpath(linkPath).catch(() => null) === target) return;
+      await fs.rm(linkPath, { force: true });
+    }
+    try {
+      await fs.symlink(target, linkPath, "dir");
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+}
+
 /**
  * Seeds auth/config into an explicit Paperclip-managed `targetHome`. Symlinks
  * `auth.json` from the shared source home (so ChatGPT-subscription credentials
