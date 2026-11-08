@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { linkKeptCodexSessionState } from "./codex-home.js";
 import { execute } from "./execute.js";
 
 // Stands in for the server's managed AI runtime: each run gets a fresh
@@ -123,5 +124,61 @@ describe("codex execute with runtime skills and a per-run provider home", () => 
     expect(second.found).toEqual([]);
     const entry = await fs.lstat(path.join(second.codexHome, "sessions"));
     expect(entry.isSymbolicLink()).toBe(false);
+  });
+});
+
+describe("linkKeptCodexSessionState", () => {
+  async function homes() {
+    const env = await setup();
+    const instanceRoot = path.join(env.root, "paperclip", "instances", "kept");
+    const credentialHome = path.join(env.root, "provider");
+    const launchHome = path.join(env.root, "launch");
+    await fs.mkdir(credentialHome, { recursive: true });
+    await fs.mkdir(launchHome, { recursive: true });
+    const linkProvider = async (target: string) => {
+      await fs.mkdir(target, { recursive: true });
+      await fs.symlink(target, path.join(credentialHome, "sessions"), "dir");
+    };
+    const link = () => linkKeptCodexSessionState(credentialHome, launchHome, process.env, "company-1");
+    const launchEntry = () => fs.lstat(path.join(launchHome, "sessions")).catch(() => null);
+    return { env, instanceRoot, credentialHome, launchHome, linkProvider, link, launchEntry };
+  }
+
+  it.each(["company-2", "company-1x"])("ignores a link into the kept sessions of %s", async (company) => {
+    const h = await homes();
+    await h.linkProvider(path.join(h.instanceRoot, "managed-ai-sessions", company, "scope-a", "sessions"));
+    await h.link();
+    expect(await h.launchEntry()).toBeNull();
+  });
+
+  it("ignores a link that stays under the kept root only by name", async () => {
+    const h = await homes();
+    const outside = path.join(h.env.root, "outside");
+    await fs.mkdir(outside, { recursive: true });
+    const companyRoot = path.join(h.instanceRoot, "managed-ai-sessions", "company-1");
+    await fs.mkdir(companyRoot, { recursive: true });
+    await fs.symlink(outside, path.join(companyRoot, "escape"), "dir");
+    await h.linkProvider(path.join(companyRoot, "escape", "sessions"));
+    await h.link();
+    expect(await h.launchEntry()).toBeNull();
+  });
+
+  it("keeps a real sessions directory already in the launch home", async () => {
+    const h = await homes();
+    await h.linkProvider(path.join(h.instanceRoot, "managed-ai-sessions", "company-1", "scope-a", "sessions"));
+    await fs.mkdir(path.join(h.launchHome, "sessions"));
+    await fs.writeFile(path.join(h.launchHome, "sessions", "rollout-own.jsonl"), "{}\n");
+    await h.link();
+    const entry = await h.launchEntry();
+    expect(entry?.isDirectory()).toBe(true);
+    expect(await fs.readdir(path.join(h.launchHome, "sessions"))).toEqual(["rollout-own.jsonl"]);
+  });
+
+  it("settles concurrent calls on the same launch home", async () => {
+    const h = await homes();
+    const kept = path.join(h.instanceRoot, "managed-ai-sessions", "company-1", "scope-a", "sessions");
+    await h.linkProvider(kept);
+    await Promise.all([h.link(), h.link(), h.link()]);
+    expect(await fs.realpath(path.join(h.launchHome, "sessions"))).toBe(await fs.realpath(kept));
   });
 });

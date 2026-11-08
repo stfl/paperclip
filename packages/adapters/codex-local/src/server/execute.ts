@@ -739,8 +739,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
       apiKey: configuredOpenAiApiKey,
     });
-    // The digest above includes a per-run credential home, so each run gets a
-    // fresh launch home; kept sessions reach it only through these links.
+    // On a managed AI connection the credential home is per run, so the digest
+    // above gives each run a fresh launch home; kept sessions reach it only
+    // through these links.
     if (runtimeSkillDigest && runtimeCredentialHome) {
       await linkKeptCodexSessionState(runtimeCredentialHome, configuredCodexHome, process.env, agent.companyId);
     }

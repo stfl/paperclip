@@ -664,20 +664,32 @@ export async function linkKeptCodexSessionState(
     instanceId: nonEmpty(env.PAPERCLIP_INSTANCE_ID) ?? undefined,
     env,
   });
-  const keptRoot = path.resolve(instanceRoot, "managed-ai-sessions", companyId);
+  const keptRoot = await fs.realpath(path.resolve(instanceRoot, "managed-ai-sessions", companyId)).catch(() => null);
+  if (!keptRoot) return;
   for (const name of KEPT_SESSION_DIRECTORIES) {
-    const link = await fs.readlink(path.join(credentialHome, name)).catch(() => null);
-    if (!link) continue;
-    const target = path.resolve(credentialHome, link);
-    if (!target.startsWith(keptRoot + path.sep)) continue;
-    const launchPath = path.join(launchHome, name);
-    const existing = await fs.lstat(launchPath).catch(() => null);
-    if (existing && !existing.isSymbolicLink()) continue;
+    const credentialPath = path.join(credentialHome, name);
+    if (!(await fs.lstat(credentialPath).catch(() => null))?.isSymbolicLink()) continue;
+    const target = await fs.realpath(credentialPath).catch(() => null);
+    if (!target?.startsWith(keptRoot + path.sep)) continue;
+    await ensureDirectoryLink(path.join(launchHome, name), target);
+  }
+}
+
+/** Concurrent runs may race on one launch home; whichever link lands first wins if it agrees. */
+async function ensureDirectoryLink(linkPath: string, target: string): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const existing = await fs.lstat(linkPath).catch(() => null);
+    if (existing && !existing.isSymbolicLink()) return;
     if (existing) {
-      if (path.resolve(launchHome, await fs.readlink(launchPath)) === target) continue;
-      await fs.unlink(launchPath);
+      if (await fs.realpath(linkPath).catch(() => null) === target) return;
+      await fs.rm(linkPath, { force: true });
     }
-    await fs.symlink(target, launchPath, "dir");
+    try {
+      await fs.symlink(target, linkPath, "dir");
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
   }
 }
 
