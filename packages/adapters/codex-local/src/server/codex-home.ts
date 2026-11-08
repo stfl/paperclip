@@ -643,6 +643,44 @@ export async function stageCodexHomeForSync(
   }
 }
 
+const KEPT_SESSION_DIRECTORIES = ["sessions", "archived_sessions"] as const;
+
+/**
+ * Codex resumes a thread only from the rollouts under its own `CODEX_HOME`.
+ * A generated launch home therefore takes over the transcript links of the
+ * credential home it seeds from, but only links into this company's kept
+ * sessions under the instance's `managed-ai-sessions/`, so a caller-owned
+ * home's own layout never leaks into a generated one. A real directory already
+ * in the launch home is left alone.
+ */
+export async function linkKeptCodexSessionState(
+  credentialHome: string,
+  launchHome: string,
+  env: NodeJS.ProcessEnv,
+  companyId: string,
+): Promise<void> {
+  const instanceRoot = resolvePaperclipInstanceRootForAdapter({
+    homeDir: nonEmpty(env.PAPERCLIP_HOME) ?? undefined,
+    instanceId: nonEmpty(env.PAPERCLIP_INSTANCE_ID) ?? undefined,
+    env,
+  });
+  const keptRoot = path.resolve(instanceRoot, "managed-ai-sessions", companyId);
+  for (const name of KEPT_SESSION_DIRECTORIES) {
+    const link = await fs.readlink(path.join(credentialHome, name)).catch(() => null);
+    if (!link) continue;
+    const target = path.resolve(credentialHome, link);
+    if (!target.startsWith(keptRoot + path.sep)) continue;
+    const launchPath = path.join(launchHome, name);
+    const existing = await fs.lstat(launchPath).catch(() => null);
+    if (existing && !existing.isSymbolicLink()) continue;
+    if (existing) {
+      if (path.resolve(launchHome, await fs.readlink(launchPath)) === target) continue;
+      await fs.unlink(launchPath);
+    }
+    await fs.symlink(target, launchPath, "dir");
+  }
+}
+
 /**
  * Seeds auth/config into an explicit Paperclip-managed `targetHome`. Symlinks
  * `auth.json` from the shared source home (so ChatGPT-subscription credentials

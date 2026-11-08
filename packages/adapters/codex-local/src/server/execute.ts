@@ -79,6 +79,7 @@ import {
   codexHomeHasUsableAuth,
   evaluateCodexCredentialReadiness,
   isManagedCodexHomePath,
+  linkKeptCodexSessionState,
   pathExists,
   prepareManagedCodexHome,
   resolveManagedCodexHomeDir,
@@ -738,6 +739,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
       apiKey: configuredOpenAiApiKey,
     });
+    // The digest above includes a per-run credential home, so each run gets a
+    // fresh launch home; kept sessions reach it only through these links.
+    if (runtimeSkillDigest && runtimeCredentialHome) {
+      await linkKeptCodexSessionState(runtimeCredentialHome, configuredCodexHome, process.env, agent.companyId);
+    }
   }
   const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
   const effectiveCodexHome = configuredCodexHome ?? defaultCodexHome;
