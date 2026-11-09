@@ -82,7 +82,6 @@ import {
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   renderTemplate,
-  resolvePaperclipInstanceRootForAdapter,
   hydrateFreshSessionHandoff,
   selectInitialCommunicationGuidance,
   selectPaperclipPromptSections,
@@ -94,6 +93,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { createEphemeralSessionEnvironmentStore } from "./ephemeral-session-environment.js";
+import { acpxEngineStateDir, defaultPaperclipInstanceDir, removeAcpxSessionRecord } from "./session-records.js";
 import {
   createAcpRuntime,
   createAgentRegistry,
@@ -820,17 +820,8 @@ export async function referencedSourceContentSignature(
   return hash.digest("hex").slice(0, 16);
 }
 
-function defaultPaperclipInstanceDir(): string {
-  const home = process.env.PAPERCLIP_HOME?.trim() || path.join(os.homedir(), ".paperclip");
-  const instanceId = process.env.PAPERCLIP_INSTANCE_ID?.trim() || "default";
-  return resolvePaperclipInstanceRootForAdapter({
-    homeDir: home,
-    instanceId,
-  });
-}
-
 function defaultStateDir(companyId: string, agentId: string): string {
-  return path.join(defaultPaperclipInstanceDir(), "companies", companyId, "acp-engine", "agents", agentId);
+  return acpxEngineStateDir(companyId, agentId);
 }
 
 function resolveManagedCodexHomeDir(companyId: string): string {
@@ -2018,7 +2009,7 @@ async function buildRuntime(input: {
     asNumber(config.timeoutSec, DEFAULT_ACP_ENGINE_TIMEOUT_SEC),
   );
   const timeoutSec = timeoutResolution.timeoutSec;
-  const stateDir = path.resolve(asString(config.stateDir, "") || defaultStateDir(agent.companyId, agent.id));
+  const stateDir = acpxEngineStateDir(agent.companyId, agent.id, asString(config.stateDir, ""));
   await fs.mkdir(stateDir, { recursive: true });
 
   const envConfig = parseObject(config.env);
@@ -3658,6 +3649,41 @@ async function emitAcpxFailure(input: {
   return { classified, message, childStderrTail };
 }
 
+/**
+ * acpx's same-session-only resume policy for persistent sessions: the record's
+ * session cannot be loaded (its transcript is gone, or a failed setup left a
+ * record without one). The class reaches the engine as a thrown error from the
+ * handshake or a config call, or as a failed turn result. Its detail code
+ * decides; without one, only acpx's own "could not be resumed" wording does,
+ * since a bare "Resource not found" can be any 404, such as an MCP server's.
+ */
+function isSessionResumeRequired(error: unknown): boolean {
+  const chain: unknown[] = [];
+  for (let current: unknown = error; current && chain.length < 5;
+    current = typeof current === "object" ? (current as { cause?: unknown }).cause : undefined) {
+    chain.push(current);
+  }
+  if (chain.some((link) => typeof link === "object" && link !== null
+    && (link as { detailCode?: unknown }).detailCode === "SESSION_RESUME_REQUIRED")) return true;
+  return chain.some((link) => {
+    const message = link instanceof Error ? link.message
+      : typeof link === "object" && link !== null && typeof (link as { message?: unknown }).message === "string"
+        ? (link as { message: string }).message
+        : typeof link === "string" ? link : "";
+    return /persistent acp session \S+ could not be resumed/i.test(message);
+  });
+}
+
+/**
+ * One attempt's report to the run: the persistent session it found it cannot
+ * resume during setup. The run discards its record and, after a first
+ * attempt, starts one fresh session; `replacing` is set on that attempt.
+ */
+interface AcpxSessionAttempt {
+  deadSession: { sessionKey: string; stateDir: string; sessionId: string | null } | null;
+  replacing: { sessionId: string | null; freshSessionId?: string } | null;
+}
+
 function isResumeFailure(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   return /resume|load|not found|no session|unknown session|conversation/i.test(message);
@@ -4053,7 +4079,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
   const stagingLocks = deps.stagingLocks ?? defaultStagingLocks;
   const engine = resolveEngineSettings(deps);
 
-  return async function executeAcpxEngine(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  const executeAttempt = async function executeAcpxEngineAttempt(
+    ctx: AdapterExecutionContext,
+    attempt: AcpxSessionAttempt,
+  ): Promise<AdapterExecutionResult> {
     let billingIdentity: AcpxEngineBillingIdentity | null = null;
     try {
       billingIdentity = (await deps.resolveBillingIdentity?.(ctx)) ?? null;
@@ -4344,6 +4373,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // The one owner of an abandoned `ensureSession` promise for this run. See
       // `HandshakeAbandonmentFence` above for the state machine.
       const handshakeFence = new HandshakeAbandonmentFence();
+      // Report a setup failure of the resume-required class to the run, which
+      // discards the record and, on a run's first attempt, starts one fresh
+      // session.
+      const reportDeadSession = (error: unknown, sessionId: string | null | undefined): boolean => {
+        if (prepared.mode !== "persistent" || !isSessionResumeRequired(error)) return false;
+        attempt.deadSession = { sessionKey: prepared.sessionKey, stateDir: prepared.stateDir, sessionId: sessionId ?? null };
+        clearSession = true;
+        return true;
+      };
       // A synthetic close handle from the prepared identity, for a close that has no
       // established session handle (a cold `ensureSession` throw or a missing
       // handle). `runtime.close` reads the session key and the runtime session name.
@@ -4659,6 +4697,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               });
             } catch (err) {
               if (!resumeSessionId || !isResumeFailure(err)) throw err;
+              // acpx would reuse the dead record by its key; the run discards
+              // it and starts the fresh session instead.
+              if (prepared.mode === "persistent" && isSessionResumeRequired(err)) throw err;
               clearSession = true;
               resumedSession = false;
               await ctx.onLog(
@@ -4746,11 +4787,12 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // again later.
           const guardTripped = isAcpxHandshakeTimeoutError(err) || isAcpxHandshakeTransportLostError(err);
           handshakeAbandoned = guardTripped;
+          const deadSession = !guardTripped && reportDeadSession(err, resumeSessionId);
           runtimeSettlement = {
             mode: "direct",
             handle: handle ?? syntheticCloseHandle(),
             reason: "paperclip handshake cleanup",
-            discardPersistentState: false,
+            discardPersistentState: deadSession,
             dropWarmEntry: true,
             recordCloseError: true,
             cancelTurnReason: null,
@@ -4823,6 +4865,13 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         }
         sessionHandle = handle;
         startupFailed = false;
+        if (attempt.replacing) {
+          attempt.replacing.freshSessionId = handle.backendSessionId ?? handle.runtimeSessionName;
+          await ctx.onLog(
+            "stdout",
+            `[paperclip] ACPX session "${attempt.replacing.sessionId ?? "unknown"}" could not be resumed; replaced it with fresh session "${attempt.replacing.freshSessionId}".\n`,
+          );
+        }
         await emitPhase("ensure_session", ensureSessionPhaseStart, "ok");
       } catch (err) {
         if (!buildRuntimeSettled) {
@@ -4873,6 +4922,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         });
         await emitPhase("configure_session", configureSessionStart, "ok");
       } catch (err) {
+        // ACPX defers session/load of a reused record to its first use, which
+        // can be this config call.
+        const deadSession = reportDeadSession(err, sessionHandle.backendSessionId);
         // Record a direct close that drops the matching warm entry for the
         // settlement `endSession` step. The settlement stops the bridges, discards
         // the staged runtime, releases the staging lease, and flushes the child
@@ -4881,7 +4933,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           mode: "direct",
           handle: sessionHandle,
           reason: "paperclip config cleanup",
-          discardPersistentState: false,
+          discardPersistentState: deadSession,
           dropWarmEntry: true,
           recordCloseError: true,
           cancelTurnReason: null,
@@ -5346,6 +5398,12 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const sessionUnavailable = terminal.status === "failed" &&
           terminal.error.detailCode === "SESSION_RESUME_REQUIRED";
         if (sessionUnavailable) clearSession = true;
+        // The deferred load failed before the provider produced anything, so
+        // the same run can start the work again in a fresh session.
+        if (sessionUnavailable && outputSegments.length === 0 && currentOutputChunk.length === 0
+          && interruptionTools.size === 0) {
+          reportDeadSession(terminal.error, sessionHandle.backendSessionId);
+        }
         // Saving a conversation is independent from certifying tool outcomes.
         // Its next turn receives history, not a replay of pending tool calls.
         preserveInterruptedSession = ctx.signal?.aborted === true && !forcedStop && !timedOut && !channelLost
@@ -5922,6 +5980,40 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         void emitRunPhaseTiming(ctx, "release_staging_lease", now() - leaseStart, "ok");
       }
     }
+  };
+
+  // acpx reuses a persistent record by its session key whether or not a
+  // resume id is passed, and a discarding close can fail before it marks the
+  // record for reset, so the record file itself goes.
+  const discardDeadRecord = async (dead: NonNullable<AcpxSessionAttempt["deadSession"]>): Promise<string | null> => {
+    const record = await createRuntimeStore({ stateDir: dead.stateDir }).load(dead.sessionKey).catch(() => undefined);
+    await removeAcpxSessionRecord(dead.stateDir, dead.sessionKey);
+    return record?.acpSessionId ?? dead.sessionId;
+  };
+
+  return async function executeAcpxEngine(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+    const first: AcpxSessionAttempt = { deadSession: null, replacing: null };
+    const result = await executeAttempt(ctx, first);
+    if (!first.deadSession) return result;
+    const sessionId = await discardDeadRecord(first.deadSession);
+    if (ctx.signal?.aborted) return result;
+    // At most one fresh session per run, with the prompt of a run that has none.
+    const fresh: AcpxSessionAttempt = { deadSession: null, replacing: { sessionId } };
+    const freshResult = await executeAttempt({
+      ...ctx,
+      runtime: { ...ctx.runtime, sessionId: null, sessionParams: null, sessionDisplayId: null },
+    }, fresh);
+    if (fresh.deadSession) await discardDeadRecord(fresh.deadSession);
+    if (freshResult.exitCode === 0) return freshResult;
+    const freshSessionId = fresh.replacing!.freshSessionId;
+    await ctx.onLog(
+      "stdout",
+      freshSessionId
+        ? `[paperclip] ACPX fresh session "${freshSessionId}" failed too; the run fails.\n`
+        : `[paperclip] ACPX session "${sessionId ?? "unknown"}" could not be resumed, and the fresh session this run started failed too.\n`,
+    );
+    // The task session named the discarded record; never resume it again.
+    return { ...freshResult, clearSession: true };
   };
 }
 
