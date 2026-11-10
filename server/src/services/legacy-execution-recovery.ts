@@ -9,13 +9,19 @@ import { claimedAdapterType, hasConversationContinuationPolicy } from "./convers
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
-import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
+import {
+  executionFailureRetryCount,
+  isProviderRateLimitWindowRun,
+  providerRateLimitWindowRetriesSpent,
+} from "./execution-recovery-attempt.js";
 import { logActivity } from "./activity-log.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { issueService } from "./issues.js";
+import { noticeMetadataReferencesRecoveryAction } from "./recovery/successful-run-handoff.js";
+import { buildStrandedRecoveryEscalationNotice } from "./recovery/stranded-notice.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
@@ -53,6 +59,16 @@ export function legacyExecutionNeedsReconciliation(
   // that the bootstrap evidence proves never started. Keep unknown outcomes held.
   if ((run.errorCode === "workspace_git_scan_timeout" || run.errorCode === "workspace_git_scan_saturated") &&
       evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
+  // The gateway refused a request of the turn, and the retry resumes the saved
+  // session, which holds every action the turn took before it: nothing is
+  // replayed. The last attempt's failure falls through to the hold below, and
+  // so does a turn that left a background task behind, which the session does
+  // not hold.
+  if (
+    isProviderRateLimitWindowRun(run) &&
+    !providerRateLimitWindowRetriesSpent(run) &&
+    !run.resultJson?.unmanagedBackgroundTask
+  ) return false;
   if (executionFailureRetryCount(run) >= 2) return true;
   return !(
     evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false
@@ -237,7 +253,7 @@ export async function terminalizeLegacyExecution(input: {
           ),
         )).limit(1);
       if (reconciled) return updated;
-      await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
+      const action = await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
         companyId: run.companyId,
         sourceIssueId: task.id,
         kind: "active_run_watchdog",
@@ -258,11 +274,51 @@ export async function terminalizeLegacyExecution(input: {
           ? "The original sandbox is retained for workspace repair. Verify that it has stopped, recover the missing files, record workspaceRepairEvidence, and explicitly remove the retained allocation when recovery is complete. A new agent turn cannot prove file recovery."
           : hasWorkspaceRestoreFailure(updated.resultJson)
           ? "Verify safe workspace staging or repair, then reconcile the stopped run before continuing. Saved work and approval decisions remain in force."
+          : providerRateLimitWindowRetriesSpent(updated)
+          ? "The provider's rate limit rejected this run again on every scheduled retry. Wait for the limit to reopen, or have it raised, then resume the issue; its saved session is kept."
           : "Inspect the stopped provider and recorded actions, then reconcile their outcomes before continuing. This adapter has not established a safe resume checkpoint.",
         maxAttempts: 3,
         wakePolicy: null,
         supersedeOnIdentityChange: true,
       });
+      // The hold is all the board sees of a rate-limit window that rejected
+      // every retry, so the thread gets the notice the stranded-issue path
+      // posts for other causes. Each sweep revisits the same action. A hold
+      // before the retries are spent has another cause, such as a background
+      // task the saved session does not cover, which the generic next action
+      // names.
+      if (providerRateLimitWindowRetriesSpent(updated)) {
+        const recent = await tx.select({ metadata: issueComments.metadata }).from(issueComments)
+          .where(and(eq(issueComments.issueId, task.id), eq(issueComments.authorType, "system")))
+          .orderBy(desc(issueComments.createdAt)).limit(50);
+        if (!recent.some((row) => noticeMetadataReferencesRecoveryAction(row.metadata, action.id))) {
+          const notice = buildStrandedRecoveryEscalationNotice({
+            seed: {
+              title: "Error: model rate limit reached",
+              body: "The provider's rate limit rejected this run on every scheduled retry. Paperclip stopped retrying and left the issue for the board.",
+              tone: "danger",
+              nextAction: action.nextAction,
+            },
+            recoveryCause: LEGACY_RECOVERY_CAUSE,
+            recoveryActionId: action.id,
+            recoveryOwner: null,
+            sourceRun: {
+              id: updated.id,
+              agentId: updated.agentId,
+              status: updated.status,
+              errorCode: updated.errorCode,
+              rateLimitWindow: true,
+            },
+          });
+          await issueService(tx as unknown as Db).addComment(
+            task.id,
+            notice.body,
+            {},
+            { authorType: "system", presentation: notice.presentation, metadata: notice.metadata },
+            tx,
+          );
+        }
+      }
     }
     return updated;
   });

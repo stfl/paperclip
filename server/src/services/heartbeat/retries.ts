@@ -12,9 +12,12 @@ import {
 } from "../conversation-continuation.js";
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
 import {
+  PROVIDER_RATE_LIMIT_WINDOW_RETRY_JITTER_MS,
+  PROVIDER_RATE_LIMIT_WINDOW_RETRY_MAX_ATTEMPTS,
   executionFailureRetryCount,
   executionRetryAttemptCount,
   accountingForScheduledRetry,
+  isProviderRateLimitWindowRun,
 } from "../execution-recovery-attempt.js";
 import { WORKSPACE_GIT_SCAN_ERROR_CODES } from "../workspace-git-operation-scheduler.js";
 import { CONTROLLER_LEASE_LOST_FAILURE_CODE } from "../legacy-controller-lease.js";
@@ -127,6 +130,15 @@ export function isTransientWorkspaceGitScanCode(code: string | null | undefined)
 
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS =
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
+
+/** Failure retries a run may still be given: the bounded default, or the rate-limit window's own. */
+export function boundedRetryMaxAttemptsForRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+) {
+  return isProviderRateLimitWindowRun(run)
+    ? PROVIDER_RATE_LIMIT_WINDOW_RETRY_MAX_ATTEMPTS
+    : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS;
+}
 
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 2;
 
@@ -427,23 +439,33 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
     const wakeReason =
       opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
+    const rateLimitWindow =
+      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
+      isProviderRateLimitWindowRun(run);
     const maxAttempts = Math.max(
       0,
-      Math.floor(
-        opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
-      ),
+      Math.floor(opts?.maxAttempts ?? boundedRetryMaxAttemptsForRun(run)),
     );
+    // The adapter's retryNotBefore sets this wait, with a jitter on top; the
+    // bounded delay table only covers the first attempts of the default budget.
+    const jitterMs = rateLimitWindow
+      ? Math.floor(
+          Math.min(Math.max((opts?.random ?? Math.random)(), 0), 1) *
+            PROVIDER_RATE_LIMIT_WINDOW_RETRY_JITTER_MS,
+        )
+      : 0;
+    const delayMs = opts?.delayMs ?? (rateLimitWindow ? jitterMs : undefined);
     const consumedAttempts = executionRetryAttemptCount(run, retryReason);
     const nextAttempt = consumedAttempts + 1;
     const computedBaseSchedule =
-      opts?.delayMs != null
+      delayMs != null
         ? nextAttempt <= maxAttempts
           ? {
               attempt: nextAttempt,
-              baseDelayMs: Math.max(0, Math.floor(opts.delayMs)),
-              delayMs: Math.max(0, Math.floor(opts.delayMs)),
+              baseDelayMs: Math.max(0, Math.floor(delayMs)),
+              delayMs: Math.max(0, Math.floor(delayMs)),
               dueAt: new Date(
-                now.getTime() + Math.max(0, Math.floor(opts.delayMs)),
+                now.getTime() + Math.max(0, Math.floor(delayMs)),
               ),
               maxAttempts,
             }
@@ -548,16 +570,15 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       }
     }
 
+    const waitUntil = transientRetryNotBefore
+      ? new Date(transientRetryNotBefore.getTime() + jitterMs)
+      : null;
     const schedule =
-      transientRetryNotBefore &&
-      transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      waitUntil && waitUntil.getTime() > baseSchedule.dueAt.getTime()
         ? {
             ...baseSchedule,
-            dueAt: transientRetryNotBefore,
-            delayMs: Math.max(
-              0,
-              transientRetryNotBefore.getTime() - now.getTime(),
-            ),
+            dueAt: waitUntil,
+            delayMs: Math.max(0, waitUntil.getTime() - now.getTime()),
           }
         : baseSchedule;
 
