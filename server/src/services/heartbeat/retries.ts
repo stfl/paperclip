@@ -49,7 +49,6 @@ import {
 import type { Db } from "@paperclipai/db";
 import {
   agents,
-  agentTaskSessions,
   agentWakeupRequests,
   executionWorkspaces,
   heartbeatRuns,
@@ -107,6 +106,7 @@ export interface HeartbeatRetryDependencies {
     options?: Parameters<HeartbeatRunState["getRun"]>[1],
   ) => Promise<Awaited<ReturnType<HeartbeatRunState["getRun"]>> | null | undefined>;
   resolveSessionBeforeForWakeup: HeartbeatRunState["resolveSessionBeforeForWakeup"];
+  getTaskSession: HeartbeatRunState["getTaskSession"];
   resolveResponsibleUserIdForRunContext: ReturnType<typeof createHeartbeatRunPreparation>["resolveResponsibleUserIdForRunContext"];
   getAgentInvokability: (agent: typeof agents.$inferSelect | null | undefined) => ReturnType<typeof evaluateAgentInvokabilityFromDb>;
   appendRunEvent: (run: HeartbeatRun, event: {
@@ -421,6 +421,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     getAgentInvokability,
     runDispatch,
     resolveSessionBeforeForWakeup,
+    getTaskSession,
     resolveResponsibleUserIdForRunContext,
     recordPlanApprovalResumeFailureRetry,
     setRunStatusIfRunning,
@@ -699,26 +700,13 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     const shouldQuarantineWorkspaceForRetry =
       workspaceValidationRetryPayload !== null &&
       Object.keys(workspaceValidationRetryPayload).length > 0;
-    const [failedAttemptSession] =
-      taskKey && typeof contextSnapshot.workspaceReconstructionActionId !== "string"
-        ? await db
-            .select({ lastRunId: agentTaskSessions.lastRunId })
-            .from(agentTaskSessions)
-            .where(
-              and(
-                eq(agentTaskSessions.companyId, agent.companyId),
-                eq(agentTaskSessions.agentId, agent.id),
-                eq(agentTaskSessions.adapterType, agent.adapterType),
-                eq(agentTaskSessions.taskKey, taskKey),
-              ),
-            )
-            .limit(1)
-        : [];
-    const {
-      forceFreshSession: _forceFreshSession,
-      taskRetryRequestId: _taskRetryRequestId,
-      ...resumedContextSnapshot
-    } = contextSnapshot;
+    const failedAttemptSession =
+      taskKey &&
+      contextSnapshot.forceFreshSession === true &&
+      typeof contextSnapshot.workspaceReconstructionActionId !== "string"
+        ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
+        : null;
+    const { forceFreshSession: _forceFreshSession, ...resumedContextSnapshot } = contextSnapshot;
     const inheritedContextSnapshot =
       failedAttemptSession?.lastRunId === run.id ? resumedContextSnapshot : contextSnapshot;
     const retryContextSnapshot: Record<string, unknown> = withRecoveryContext(
