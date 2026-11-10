@@ -101,7 +101,7 @@ import { RUNNERD_CONTROL_PLANE_STATE_SCHEMAS, runnerdStateIsIncompleteBootstrap,
   runnerdStateHasNoProviderTurn, runnerdStateIsOpenedSessionBeforeTurn, runnerdStateIsUnconnectedBootstrap } from "./native-bootstrap-proof.js";
 import { createNativeDeliverableTextObservation } from "./native-deliverable-text.js";
 import { createNativeGitHubAccess, type NativeGitHubAccess } from "./native-github-access.js";
-import { resolveGitHubOperationCredentials } from "../github-operation-credentials.js";
+import { resolveBrokerGitHubCredentials } from "../github-operation-credentials.js";
 import { bindManagedNativeCredentialTurn, completeManagedNativeCredentialTurn } from "./managed-native-credentials.js";
 import { createLocalNativeQuestionBridge } from "./local-native-question-bridge.js";
 import { createArtifactInstaller } from "./artifact-transfer.js";
@@ -10973,7 +10973,7 @@ async function executePaperclipNativeSessionAttempt(
           target: input.runnerExecutionTarget,
           cwd: input.execution.workspace.cwd!,
           env: resolveNativeProviderEnvironment(input.execution.provider, input.runnerEnvironment),
-          resolveCredentials: (binding) => resolveGitHubOperationCredentials(input.db, binding),
+          resolveCredentials: (binding) => resolveBrokerGitHubCredentials(input.db, binding),
           onLog: input.onLog,
         }));
         executionContext?.assertOpen();
