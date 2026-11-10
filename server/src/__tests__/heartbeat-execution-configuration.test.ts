@@ -622,6 +622,22 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     expect(prepared.mergedConfig.workspaceStrategy).toEqual({ type: "project_primary" });
   });
 
+  it("routes GitHub through the managed broker for a sandbox run of an agent that binds access.GH_TOKEN", async () => {
+    const f = await seed();
+    const sandbox = { id: randomUUID(), driver: "sandbox", envVars: null };
+    const binding = { "access.GH_TOKEN": { type: "secret_ref", secretId: randomUUID(), version: "latest" } };
+    const prepared = async (config: Record<string, unknown>, environment: typeof sandbox | null) => {
+      const result = await (await configuration(f, config, {}, "paperclip_runner", false, "shared_workspace", environment as never)).prepare();
+      if (!result.prepared) throw new Error("not prepared");
+      return result;
+    };
+    const bound = await prepared(binding, sandbox);
+    expect(bound.githubSelection).toEqual({ configured: true });
+    expect(bound.useHostGitHub).toBe(false);
+    expect((await prepared({}, sandbox)).githubSelection.configured).toBe(false);
+    expect((await prepared(binding, null)).githubSelection.configured).toBe(false);
+  });
+
   it.each(["fresh", "saved empty"])("prepares a %s native skill selection while another run holds the company cache lock", async kind => {
     const f = await seed();
     const selected = kind === "saved empty" ? await companySkillService(db).createLocalSkill(f.companyId, { name: "Later assignment" }) : null;

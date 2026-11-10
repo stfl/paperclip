@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { isUuidLike } from "@paperclipai/shared";
 import {
   agents,
@@ -12,9 +12,13 @@ import {
 import { forbidden } from "../errors.js";
 import { captureRunIdentity, type RunIdentityContext } from "./run-identity.js";
 import {
+  AGENT_GITHUB_TOKEN_CONFIG_PATH,
+  agentGitHubTokenBinding,
   buildGitAuthInvocation,
   resolveManagedGitHubCredential,
 } from "./git-credentials.js";
+import { authorizationService } from "./authorization.js";
+import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import { secretService } from "./secrets.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { isLowTrustQuarantined } from "./source-trust.js";
@@ -116,7 +120,42 @@ async function saveGitHubSummary(
     .where(eq(runIdentityContexts.id, context.id));
 }
 
-/** No company secrets or ambient credentials are consulted by this path. */
+function installationAuthorEnv(base: Record<string, string>): Record<string, string> {
+  const name = process.env.PAPERCLIP_GITHUB_INSTALLATION_AUTHOR_NAME?.trim();
+  const email = process.env.PAPERCLIP_GITHUB_INSTALLATION_AUTHOR_EMAIL?.trim();
+  const entries: Array<[string, string]> = [];
+  if (name && email && !/[\0\r\n<>]/.test(name + email)) {
+    entries.push(["user.name", name], ["user.email", email]);
+  }
+  let includes: unknown = [];
+  try {
+    includes = JSON.parse(process.env.PAPERCLIP_GITHUB_INSTALLATION_AUTHOR_INCLUDES ?? "[]");
+  } catch {
+    includes = [];
+  }
+  for (const entry of Array.isArray(includes) ? includes : []) {
+    const { pattern, path } = (entry ?? {}) as Record<string, unknown>;
+    if (
+      typeof pattern !== "string" || typeof path !== "string" ||
+      !pattern || !path.startsWith("/") || /[\0\r\n]/.test(pattern + path)
+    ) continue;
+    entries.push([`includeIf.hasconfig:remote.*.url:${pattern}.path`, path]);
+  }
+  const first = Number(base.GIT_CONFIG_COUNT) || 0;
+  const env: Record<string, string> = {};
+  entries.forEach(([key, value], i) => {
+    env[`GIT_CONFIG_KEY_${first + i}`] = key;
+    env[`GIT_CONFIG_VALUE_${first + i}`] = value;
+  });
+  if (entries.length > 0) env.GIT_CONFIG_COUNT = String(first + entries.length);
+  return env;
+}
+
+/**
+ * No company secrets or ambient credentials are consulted by this path, except with
+ * `agentToken` the secret the agent itself binds at `access.GH_TOKEN`, read at each operation,
+ * for a company with no managed GitHub connection.
+ */
 export async function resolveGitHubOperationCredentials(
   db: Db,
   input: {
@@ -124,6 +163,7 @@ export async function resolveGitHubOperationCredentials(
     agentId: string;
     runId: string;
   },
+  options?: { agentToken?: boolean },
 ) {
   const { run, context } = await captureRunIdentity(db, input, { readScope: "github_credentials" });
   if (!context) throw forbidden("This run predates managed GitHub credentials");
@@ -166,7 +206,74 @@ export async function resolveGitHubOperationCredentials(
             : null,
       },
     );
-    if (resolved.credential) {
+    const tokenBinding = !resolved.configured && options?.agentToken
+      ? await db
+          .select({ adapterConfig: agents.adapterConfig })
+          .from(agents)
+          .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)))
+          .then(([agent]) => agentGitHubTokenBinding(agent?.adapterConfig))
+      : null;
+    if (tokenBinding) {
+      const issueId =
+        typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null;
+      const [markers] = await db
+        .select({
+          admittedScope: sql<{ kind?: unknown; issueId?: unknown } | null>`${heartbeatRuns.contextSnapshot}->'paperclipAgentJwtScope'`,
+          skillTest: sql<unknown>`${heartbeatRuns.contextSnapshot}->'paperclipSkillTest'`,
+        })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)));
+      const admittedScope = markers?.admittedScope ?? undefined;
+      const [issueRow] = issueId
+        ? await db
+            .select({ workMode: issues.workMode })
+            .from(issues)
+            .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)))
+        : [];
+      const skillTest =
+        issueRow?.workMode === "skill_test" ||
+        admittedScope?.kind === "skill_test" ||
+        Boolean(markers?.skillTest);
+      const scopeIssueId = issueId ?? (typeof admittedScope?.issueId === "string" ? admittedScope.issueId : null);
+      if (skillTest && !scopeIssueId) throw forbidden("A skill-test run has no GitHub token");
+      const decision = await authorizationService(db).decide({
+        actor: {
+          type: "agent",
+          agentId: input.agentId,
+          companyId: input.companyId,
+          source: "agent_jwt",
+          keyId: null,
+          keyScope: skillTest ? { kind: "skill_test", issueId: scopeIssueId! } : null,
+          runId: input.runId,
+        },
+        action: "secrets:read",
+        resource: { type: "company", companyId: input.companyId },
+      });
+      if (!decision.allowed) throw forbidden(decision.explanation);
+      const context = {
+        consumerType: "agent" as const,
+        consumerId: input.agentId,
+        configPath: AGENT_GITHUB_TOKEN_CONFIG_PATH,
+        actorType: "agent" as const,
+        actorId: input.agentId,
+        issueId,
+        heartbeatRunId: input.runId,
+        responsibleUserId: null,
+      };
+      const token = (
+        await secretService(db).resolveSecretValue(
+          input.companyId,
+          tokenBinding.secretId,
+          tokenBinding.version,
+          { bindingContext: context, accessContext: context },
+        )
+      ).trim();
+      if (!token) throw new Error("The agent's GitHub token is empty");
+      await createRunSecretRedactionRegistry(db).register(input.companyId, input.runId, token);
+      summary = { status: "available", authenticationMode: "managed" };
+      const base = buildGitAuthInvocation({ token, source: "company_secret", secretName: null }).env;
+      env = { ...base, ...installationAuthorEnv(base) };
+    } else if (resolved.credential) {
       summary = {
         status: "available",
         source: resolved.credential.identitySource,
@@ -197,4 +304,11 @@ export async function resolveGitHubOperationCredentials(
     ...summary,
     env,
   };
+}
+
+export function resolveBrokerGitHubCredentials(
+  db: Db,
+  binding: { companyId: string; agentId: string; runId: string },
+) {
+  return resolveGitHubOperationCredentials(db, binding, { agentToken: true });
 }
