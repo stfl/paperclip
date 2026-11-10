@@ -291,4 +291,46 @@ describePostgres("scheduling a retry for a rate-limit window", () => {
     expect(retry.sessionIdBefore).toBe("acp-session-1");
     expect(shouldResetTaskSessionForWake(retry.contextSnapshot)).toBe(false);
   });
+
+  describe("a failed run whose context asks for a fresh session", () => {
+    async function retryOfBoardRetry(savedByFailedRun: boolean, extraContext: Record<string, unknown> = {}) {
+      const { run, agent, companyId } = await failedRunWithRetries(1, {
+        errorCode: "provider_quota", resultJson: windowResult(new Date(now.getTime() + QUARTER_HOUR_MS)),
+      });
+      const taskRetryRequestId = randomUUID();
+      const failed = {
+        ...run,
+        contextSnapshot: {
+          ...(run.contextSnapshot as Record<string, unknown>), forceFreshSession: true, taskRetryRequestId, ...extraContext,
+        },
+      };
+      await db.insert(agentTaskSessions).values({
+        companyId, agentId: agent.id, adapterType: "claude_local", taskKey: "window-task",
+        sessionParamsJson: { sessionId: "acp-session-1" }, sessionDisplayId: "acp-session-1",
+        lastRunId: savedByFailedRun ? run.id : null,
+      });
+      await boundRetries().scheduleBoundedRetryForRun(failed, agent, { now });
+      const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id));
+      return { retry, taskRetryRequestId };
+    }
+
+    it("resumes the session once the failed run saved its own", async () => {
+      const { retry } = await retryOfBoardRetry(true);
+      expect(retry.contextSnapshot).not.toHaveProperty("forceFreshSession");
+      expect(retry.contextSnapshot).not.toHaveProperty("taskRetryRequestId");
+      expect(shouldResetTaskSessionForWake(retry.contextSnapshot)).toBe(false);
+    });
+
+    it("keeps the request when the failed run saved no session", async () => {
+      const { retry, taskRetryRequestId } = await retryOfBoardRetry(false);
+      expect(retry.contextSnapshot).toMatchObject({ forceFreshSession: true, taskRetryRequestId });
+      expect(shouldResetTaskSessionForWake(retry.contextSnapshot)).toBe(true);
+    });
+
+    it("keeps the request on a workspace reconstruction retry although the failed run saved its session", async () => {
+      const { retry, taskRetryRequestId } = await retryOfBoardRetry(true, { workspaceReconstructionActionId: randomUUID() });
+      expect(retry.contextSnapshot).toMatchObject({ forceFreshSession: true, taskRetryRequestId });
+      expect(shouldResetTaskSessionForWake(retry.contextSnapshot)).toBe(true);
+    });
+  });
 });
