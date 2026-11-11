@@ -14,6 +14,8 @@ import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { hasLiveLegacyController } from "./legacy-controller-lease.js";
 import { reportRunFailure } from "./run-failure-report.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
+import { EXECUTION_FINALIZATION_DEADLINE_EXCEEDED, EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 
 /** Only newly recorded control deadlines are eligible. Upgrades never replay ambiguous historical runs. */
 export async function reconcileAbandonedExecutionControl(
@@ -120,6 +122,24 @@ export async function reconcileAbandonedExecutionControl(
             ].some((deadline) => deadline && deadline <= now)
           )
             return false;
+          if (coordinator && !coordinator.resultId && run.status === "running") {
+            const nativeOwnerLeaseAt = coordinator.leaseOwner && coordinator.leaseExpiresAt && coordinator.leaseExpiresAt > now
+              ? coordinator.leaseExpiresAt : null;
+            const sameRunResumeScheduled = coordinator.phase === "retryable_failure" && !coordinator.leaseOwner;
+            const nativeSettlementDue = Boolean(coordinator.controlDeadlineAt && coordinator.controlDeadlineAt <= now);
+            if (!nativeSettlementDue && (nativeOwnerLeaseAt || sameRunResumeScheduled)) {
+              await tx.update(heartbeatRuns).set({ executionControlDeadlineAt: null }).where(eq(heartbeatRuns.id, run.id));
+              return false;
+            }
+            if (nativeOwnerLeaseAt) {
+              await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionFinalization);
+              await tx.update(nativeRunFinalizations).set({ controlDeadlineAt: nativeOwnerLeaseAt })
+                .where(eq(nativeRunFinalizations.runId, run.id));
+              await tx.update(heartbeatRuns).set({ executionControlDeadlineAt: run.executionControlDeadlineAt ? nativeOwnerLeaseAt : null })
+                .where(eq(heartbeatRuns.id, run.id));
+              return false;
+            }
+          }
           await tx
             .update(heartbeatRuns)
             .set({ executionControlDeadlineAt: null })
@@ -160,9 +180,8 @@ export async function reconcileAbandonedExecutionControl(
               .where(eq(heartbeatRuns.id, run.id));
             return false;
           }
-          const cause = "execution_finalization_deadline_exceeded";
-          const nextAction =
-            "Inspect the failed run and verify its provider has stopped. Reconcile any uncertain external action before explicitly continuing this task.";
+          const cause = EXECUTION_FINALIZATION_DEADLINE_EXCEEDED;
+          const nextAction = EXECUTION_FINALIZATION_DEADLINE_MESSAGE;
           if (coordinator)
             await tx
               .update(nativeRunFinalizations)
