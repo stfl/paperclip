@@ -126,6 +126,7 @@ function dependencies() {
     getRun: vi.fn<HeartbeatRetryDependencies["getRun"]>(async () => null),
     getAgent: vi.fn<HeartbeatRetryDependencies["getAgent"]>(async () => undefined),
     resolveSessionBeforeForWakeup: vi.fn(async () => null),
+    getTaskSession: vi.fn(async () => null as never),
     resolveResponsibleUserIdForRunContext: vi.fn(async () => "retry-user"),
     getAgentInvokability: vi.fn<HeartbeatRetryDependencies["getAgentInvokability"]>(async () => ({ invokable: true })),
     appendRunEvent: vi.fn<HeartbeatRetryDependencies["appendRunEvent"]>(async () => undefined),
@@ -203,7 +204,7 @@ describePostgres("scheduling a retry for a rate-limit window", () => {
     return createHeartbeatRetries(db, {
       ...dependencies(), getRun: state.getRun, getAgent: state.getAgent,
       hasCaseHandoffForRun: async (run: Pick<Run, "id" | "companyId">) => Boolean(await pendingCaseHandoffForRun(db, run.id, run.companyId)),
-      resolveSessionBeforeForWakeup: state.resolveSessionBeforeForWakeup,
+      resolveSessionBeforeForWakeup: state.resolveSessionBeforeForWakeup, getTaskSession: state.getTaskSession,
       getAgentInvokability: (agent: Agent | null | undefined) => evaluateAgentInvokabilityFromDb(db, agent),
       runDispatch: createRunDispatch(db),
     });
@@ -293,7 +294,7 @@ describePostgres("scheduling a retry for a rate-limit window", () => {
   });
 
   describe("a failed run whose context asks for a fresh session", () => {
-    async function retryOfBoardRetry(savedByFailedRun: boolean, extraContext: Record<string, unknown> = {}) {
+    async function retryOfBoardRetry(session: "failed-run" | "earlier-run" | "none", extraContext: Record<string, unknown> = {}) {
       const { run, agent, companyId } = await failedRunWithRetries(1, {
         errorCode: "provider_quota", resultJson: windowResult(new Date(now.getTime() + QUARTER_HOUR_MS)),
       });
@@ -304,31 +305,31 @@ describePostgres("scheduling a retry for a rate-limit window", () => {
           ...(run.contextSnapshot as Record<string, unknown>), forceFreshSession: true, taskRetryRequestId, ...extraContext,
         },
       };
-      await db.insert(agentTaskSessions).values({
+      if (session !== "none") await db.insert(agentTaskSessions).values({
         companyId, agentId: agent.id, adapterType: "claude_local", taskKey: "window-task",
         sessionParamsJson: { sessionId: "acp-session-1" }, sessionDisplayId: "acp-session-1",
-        lastRunId: savedByFailedRun ? run.id : null,
+        lastRunId: session === "failed-run" ? run.id : null,
       });
       await boundRetries().scheduleBoundedRetryForRun(failed, agent, { now });
       const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id));
       return { retry, taskRetryRequestId };
     }
 
-    it("resumes the session once the failed run saved its own", async () => {
-      const { retry } = await retryOfBoardRetry(true);
+    it("drops the request once the task session is the failed run's", async () => {
+      const { retry, taskRetryRequestId } = await retryOfBoardRetry("failed-run");
       expect(retry.contextSnapshot).not.toHaveProperty("forceFreshSession");
-      expect(retry.contextSnapshot).not.toHaveProperty("taskRetryRequestId");
+      expect(retry.contextSnapshot).toMatchObject({ taskRetryRequestId });
       expect(shouldResetTaskSessionForWake(retry.contextSnapshot)).toBe(false);
     });
 
-    it("keeps the request when the failed run saved no session", async () => {
-      const { retry, taskRetryRequestId } = await retryOfBoardRetry(false);
+    it.each(["earlier-run", "none"] as const)("keeps the request when the task session is %s", async session => {
+      const { retry, taskRetryRequestId } = await retryOfBoardRetry(session);
       expect(retry.contextSnapshot).toMatchObject({ forceFreshSession: true, taskRetryRequestId });
       expect(shouldResetTaskSessionForWake(retry.contextSnapshot)).toBe(true);
     });
 
-    it("keeps the request on a workspace reconstruction retry although the failed run saved its session", async () => {
-      const { retry, taskRetryRequestId } = await retryOfBoardRetry(true, { workspaceReconstructionActionId: randomUUID() });
+    it("keeps the request on a workspace reconstruction retry although the task session is the failed run's", async () => {
+      const { retry, taskRetryRequestId } = await retryOfBoardRetry("failed-run", { workspaceReconstructionActionId: randomUUID() });
       expect(retry.contextSnapshot).toMatchObject({ forceFreshSession: true, taskRetryRequestId });
       expect(shouldResetTaskSessionForWake(retry.contextSnapshot)).toBe(true);
     });
