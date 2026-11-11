@@ -48,10 +48,15 @@ clone.
    issue whose PR landed (with the evidence as a comment) and labels
    `check-successor` on a PR closed unmerged.
 4. `routine.sh build-next`.
+   - A branch whose real base (where it leaves upstream `master`) is not in
+     the release waits for a release that contains it: `plan` marks it
+     `WAITING for a release` and `build-next` prints `WAITING:`, leaves it
+     out of `stfl-next` and merges the others. It is not a conflict: no
+     port, no `needs-rebase`. Put the line in the summary.
    - Exit 10: nothing to do. Go to step 7.
    - Exit 0: built. Go to step 6.
    - Exit 3: a branch conflicts. It prints `branch=`, `issue=`, `old_base=`,
-     `old_tip=` and `new_base=`. Port it (step 5), then run `build-next`
+     `old_tip=` and `new_base=`; `old_base` is the branch's real base. Port it (step 5), then run `build-next`
      again; it starts over from `master` and uses the ported tip.
 5. Port the conflicting branch:
    1. `routine.sh port-begin <branch>` rebases it onto its new base in the

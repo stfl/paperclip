@@ -209,6 +209,18 @@ old_tip_of() { # the tip origin had before this run ported it
 
 is_ancestor() { G merge-base --is-ancestor "$1" "$2" 2>/dev/null; }
 
+# Where a branch leaves upstream master.
+real_base_of() { G merge-base "$1" refs/remotes/upstream/master; }
+
+# Prints a branch's real base when the release does not contain it: the
+# branch waits for a release, since merging it would bring in every upstream
+# commit between the release and that base.
+waiting_base() {
+	local base
+	base=$(real_base_of "$(tip_of "$1")") || return 0
+	is_ancestor "$base" "$MASTER" || printf '%s\n' "$base"
+}
+
 # push_ref <commit> <branch> <expected old commit, "" for absent, "-" for no lease>
 push_ref() {
 	local sha=$1 branch=$2 lease=$3 out
@@ -442,10 +454,12 @@ rebuild_reasons() { # [issue numbers to treat as closed...]
 		printf 'master moved: %s is not built on %s\n' "$CURRENT_NEXT" "$RELEASE"
 		return
 	fi
-	want=$(open_issues | while IFS=$'\t' read -r n _ b _ _; do [[ $skip == *" $n "* ]] || printf '%s\n' "$b"; done)
+	want=$(open_issues | while IFS=$'\t' read -r n _ b _ _; do
+		[[ $skip == *" $n "* || -n $(waiting_base "$b") ]] || printf '%s\n' "$b"
+	done)
 	while read -r b; do
 		[[ -z $b ]] || grep -qxF -- "$b" <<<"$want" ||
-			printf '%s is merged in %s but its issue is not open\n' "$b" "$CURRENT_NEXT"
+			printf '%s is merged in %s but its issue is not open or it waits for a release\n' "$b" "$CURRENT_NEXT"
 	done < <(next_merged_branches)
 	while read -r b; do
 		[[ -n $b ]] || continue
@@ -483,7 +497,7 @@ old_base_of() {
 	n=$(issue_of_branch "$1")
 	deps=$(issue_field "$n" 5)
 	if [[ $deps == - ]]; then
-		G merge-base "$(old_tip_of "$1")" "$MASTER"
+		real_base_of "$(old_tip_of "$1")"
 	else
 		old_tip_of "${deps%%,*}"
 	fi
@@ -514,8 +528,14 @@ cmd_build_next() {
 	record "stfl-next: rebuilding: $shown"
 	rm -f "$STATE_DIR/built" "$STATE_DIR/conflict"
 	ensure_build_worktree
-	local n b deps tip dep count=0
+	local n b deps tip dep base count=0 waiting=0
 	while IFS=$'\t' read -r n _ b _ deps; do
+		base=$(waiting_base "$b")
+		if [[ -n $base ]]; then
+			record "WAITING: $b (#$n) is based on upstream ${base:0:12}, which $RELEASE does not contain: left out of stfl-next until a release does"
+			waiting=$((waiting + 1))
+			continue
+		fi
 		tip=$(tip_of "$b")
 		if [[ $deps != - ]]; then
 			for dep in ${deps//,/ }; do
@@ -537,7 +557,7 @@ cmd_build_next() {
 		log "merged #$n $b"
 	done < <(open_issues)
 	B rev-parse HEAD >"$STATE_DIR/built"
-	record "stfl-next: built $(cat "$STATE_DIR/built") from $count branches on $RELEASE"
+	record "stfl-next: built $(cat "$STATE_DIR/built") from $count branches on $RELEASE, $waiting waiting for a release"
 }
 
 # ---------------------------------------------------------------- port
@@ -546,6 +566,7 @@ cmd_port_begin() {
 	need_state
 	local b=${1:?branch}
 	[[ -n $(issue_of_branch "$b") ]] || die "$b is not the branch of an open issue"
+	[[ -z $(waiting_base "$b") ]] || die "$b waits for a release that contains its base: there is nothing to port"
 	local old_base old_tip new_base
 	old_base=$(old_base_of "$b")
 	old_tip=$(old_tip_of "$b")
@@ -715,7 +736,7 @@ cmd_save_rerere() {
 
 cmd_plan() {
 	need_state
-	local n labels branch pr deps out decision a closing=()
+	local n labels branch pr deps out decision a base closing=()
 	printf 'release: %s (%s), on upstream master\n' "$RELEASE" "$MASTER"
 	printf 'master: %s at %s, %s\n' "$FORK" "${OLD_MASTER:0:12}" "$MASTER_MOVE"
 	printf 'issues:\n'
@@ -729,6 +750,8 @@ cmd_plan() {
 			;;
 		successor) a="add check-successor: $a" ;;
 		esac
+		base=$(waiting_base "$branch")
+		[[ -z $base ]] || a+="; WAITING for a release: based on upstream ${base:0:12}, not in $RELEASE"
 		printf '  #%-3s %-60s [%s] %s\n' "$n" "$branch" "$labels" "$a"
 	done < <(open_issues)
 	local reasons
