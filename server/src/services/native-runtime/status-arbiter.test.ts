@@ -149,8 +149,9 @@ describe("native status authority", () => {
       effects: [],
     });
     expect(arbitrate({ assessment: passive })).toMatchObject({
-      reasonCode: "live_continuation_registered",
-      effects: [expect.objectContaining({ kind: "enqueue_continuation" })],
+      reasonCode: "response_wake_waiting_for_input",
+      toStatus: "in_progress",
+      effects: [],
     });
     expect(
       arbitrate({ assessment: passive, boardResponseWaitOrigin: true }),
@@ -366,13 +367,9 @@ describe("native status authority", () => {
       }),
     ).toEqual(
       expect.objectContaining({
-        reasonCode: "live_continuation_registered",
-        effects: [
-          expect.objectContaining({
-            kind: "enqueue_continuation",
-            continuationKind: "response_wake",
-          }),
-        ],
+        statusAction: "in_progress",
+        reasonCode: "response_wake_waiting_for_input",
+        effects: [],
       }),
     );
     expect(arbitrate({ terminalState: "cancelled" })).toEqual(
@@ -582,7 +579,7 @@ describe("native status authority", () => {
       expect.objectContaining({
         statusAction: "blocked",
         toStatus: "blocked",
-        policyVersion: "phase6-v13",
+        policyVersion: "phase6-v14",
         reasonCode: "current_track_blocker_waiting",
         unblockDescriptor: {
           owner: "board",
