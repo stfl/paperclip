@@ -761,6 +761,8 @@ type ImportBehaviorOptions = {
   mode?: ImportMode;
   sourceCompanyId?: string | null;
   pauseAutomations?: boolean;
+  /** The import is made by an agent key rather than the board. */
+  agentActor?: boolean;
 };
 
 type AgentLike = {
@@ -5277,6 +5279,26 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       )
     ) {
       throw unprocessable("Safe import routes only allow create or skip actions.");
+    }
+
+    // An agent's import (a CEO's safe import, a catalog team) may not create an
+    // agent carrying sandbox settings, which are the board's; and no import
+    // gives them to an adapter that ignores them.
+    {
+      const sandboxKeys = ["filesystemScope", "networkScope", "filesystemExtraPaths", "filesystemSandboxCommand"];
+      for (const entry of plan.preview.plan.agentPlans.filter((candidate) => candidate.action !== "skip")) {
+        const manifestAgent = plan.source.manifest.agents.find((candidate) => candidate.slug === entry.slug);
+        const override = input.adapterOverrides?.[entry.slug];
+        const config: Record<string, unknown> = override?.adapterConfig ?? manifestAgent?.adapterConfig ?? {};
+        const adapterType = override?.adapterType ?? manifestAgent?.adapterType;
+        const named = sandboxKeys.filter((key) => config[key] !== undefined && config[key] !== null);
+        if (named.length > 0 && options?.agentActor === true) {
+          throw forbidden(`Only the board can set the sandbox settings of an agent (${named.join(", ")}).`);
+        }
+        if (named.length > 0 && adapterType !== "claude_local" && adapterType !== "codex_local") {
+          throw unprocessable(`Adapter type "${adapterType}" does not enforce sandbox settings; remove them first.`);
+        }
+      }
     }
 
     const sourceManifest = plan.source.manifest;
