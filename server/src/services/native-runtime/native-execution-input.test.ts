@@ -5,6 +5,7 @@ import { formatDurableQuestionResponseSummary } from "../question-response-deliv
 import { nativeCompletionSource, buildNativeCompletionContract } from "./completion-contracts.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
+import { MAX_TASK_PROMPT_DESCRIPTION_CHARS, TASK_DESCRIPTION_TRUNCATED_NOTE } from "../heartbeat/task-markdown.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 import { buildNativeModelEnvelope, canonicalNativeRuntimeContextDigest } from "../../vendor/paperclip-runner/index.js";
 
@@ -30,6 +31,32 @@ describe("LCA-05 explicit native work mode", () => {
       expect(input.executionMode).toBe(workMode === "planning" ? "plan" : "default");
       expect(input.task.title).toBe(text);
     }
+  });
+});
+
+describe("native execution input description budget", () => {
+  const build = (description: string) => buildNativeExecutionInput({
+    companyId: "10000000-0000-4000-8000-000000000001",
+    runId: "50000000-0000-4000-8000-000000000005",
+    agentId: "30000000-0000-4000-8000-000000000003",
+    issue: { id: "20000000-0000-4000-8000-000000000002", identifier: "DESC-1", title: "Long brief", description, workMode: "standard" },
+    taskPrompt: "Do the work.",
+    workspace: { id: "50000000-0000-4000-8000-000000000005", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+    normalizedSessionId: null,
+    provider: "codex",
+    codexReasoningEffort: "high",
+    planningContext: null,
+    completionContract: { id: "70000000-0000-4000-8000-000000000007", sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Deliver the requested work", criteria: [{ id: "output", requirement: "Deliver the requested work" }] } },
+    runtimeContext: nativeRuntimeContextFixture(),
+  });
+
+  it("cuts a description past the budget and says so", () => {
+    const cut = build("x".repeat(MAX_TASK_PROMPT_DESCRIPTION_CHARS + 1)).task.description!;
+    expect(cut).toBe(`${"x".repeat(MAX_TASK_PROMPT_DESCRIPTION_CHARS)}\n${TASK_DESCRIPTION_TRUNCATED_NOTE}`);
+  });
+
+  it("passes a description within the budget through", () => {
+    expect(build("Short brief.").task.description).toBe("Short brief.");
   });
 });
 
