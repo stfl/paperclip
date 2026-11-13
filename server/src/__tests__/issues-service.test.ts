@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { asc, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { sql } from "drizzle-orm";
 import {
@@ -4130,6 +4130,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(workspaceOperations);
+    await db.delete(heartbeatRuns);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
@@ -4683,6 +4684,122 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
       isDependencyReady: true,
       pendingFinalizeBlockerIssueIds: [],
+    });
+  });
+
+  describe("saved-work recovery and the workspace-finalize barrier", () => {
+    const at = (seconds: number) => new Date(Date.parse("2026-05-23T22:00:00.000Z") + seconds * 1_000);
+
+    async function seedRecoveredBlocker() {
+      const seeded = await seedSharedWorkspaceDependency();
+      const { companyId, executionWorkspaceId, blockerId, assigneeAgentId } = seeded;
+      const [failedRunId, newestRunId] = [randomUUID(), randomUUID()];
+      await db.insert(heartbeatRuns).values([
+        { id: failedRunId, companyId, agentId: assigneeAgentId, status: "failed" },
+        { id: newestRunId, companyId, agentId: assigneeAgentId, status: "succeeded" },
+      ]);
+      const operation = (heartbeatRunId: string, phase: string, status: string, startedAt: Date) => ({
+        companyId, executionWorkspaceId, issueId: blockerId, heartbeatRunId, phase, status,
+        startedAt, finishedAt: new Date(startedAt.getTime() + 500),
+      });
+      // The newest run saved the workspace before recovery saved the files of
+      // the older failed run, so the recovery is the blocker's latest operation.
+      await db.insert(workspaceOperations).values([
+        operation(failedRunId, "workspace_finalize", "failed", at(0)),
+        operation(newestRunId, "workspace_finalize", "failed", at(60)),
+        operation(newestRunId, "workspace_finalize", "succeeded", at(61)),
+        operation(failedRunId, "workspace_recovery", "succeeded", at(68)),
+      ]);
+      const recoveryFinalize = (heartbeatRunId: string, startedAt: Date) => ({
+        companyId, issueId: blockerId, heartbeatRunId, phase: "workspace_finalize", status: "succeeded",
+        startedAt, finishedAt: startedAt, metadata: { owningService: "workspace_recovery" },
+      });
+      return { ...seeded, failedRunId, newestRunId, operation, recoveryFinalize };
+    }
+
+    it("releases dependents once the recovery of an older run has recorded its finalize", async () => {
+      const { companyId, blockerId, dependentId, failedRunId, recoveryFinalize } = await seedRecoveredBlocker();
+
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: false,
+        pendingFinalizeBlockerIssueIds: [blockerId],
+      });
+
+      await db.insert(workspaceOperations).values(recoveryFinalize(failedRunId, at(70)));
+
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: true,
+        pendingFinalizeBlockerIssueIds: [],
+        unresolvedBlockerIssueIds: [],
+      });
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+        expect.objectContaining({ id: dependentId, blockerIssueIds: [blockerId] }),
+      ]);
+      const listed = (await svc.list(companyId, { status: "blocked" }))
+        .find((issue) => issue.id === dependentId);
+      expect(listed?.blockerAttention?.pendingFinalizeBlockerIssueIds ?? []).toEqual([]);
+    });
+
+    it("releases dependents when the recovered run's latest operation is its failed finalize", async () => {
+      const { companyId, blockerId, dependentId, failedRunId, operation, recoveryFinalize } = await seedRecoveredBlocker();
+      await db.delete(workspaceOperations).where(and(
+        eq(workspaceOperations.companyId, companyId), eq(workspaceOperations.phase, "workspace_recovery")));
+      await db.insert(workspaceOperations).values([
+        operation(failedRunId, "workspace_finalize", "failed", at(68)),
+        recoveryFinalize(failedRunId, at(70)),
+      ]);
+
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: true,
+        pendingFinalizeBlockerIssueIds: [],
+      });
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toHaveLength(1);
+    });
+
+    it("keeps the barrier for a recovery finalize of another run, an earlier one, and an unfinished operation", async () => {
+      const { companyId, blockerId, dependentId, failedRunId, newestRunId, recoveryFinalize } = await seedRecoveredBlocker();
+      const pending = { isDependencyReady: false, pendingFinalizeBlockerIssueIds: [blockerId] };
+
+      await db.insert(workspaceOperations).values([
+        recoveryFinalize(newestRunId, at(70)),
+        recoveryFinalize(failedRunId, at(30)),
+      ]);
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject(pending);
+
+      await db.insert(workspaceOperations).values(recoveryFinalize(failedRunId, at(70)));
+      await db.update(workspaceOperations).set({ status: "running", finishedAt: null }).where(and(
+        eq(workspaceOperations.companyId, companyId), eq(workspaceOperations.phase, "workspace_recovery")));
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject(pending);
+    });
+
+    it("keeps the barrier for blocker work started after the recovery finalize", async () => {
+      const { blockerId, dependentId, failedRunId, newestRunId, operation, recoveryFinalize } = await seedRecoveredBlocker();
+      await db.insert(workspaceOperations).values([
+        recoveryFinalize(failedRunId, at(70)),
+        operation(newestRunId, "worktree_prepare", "succeeded", at(80)),
+      ]);
+
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: false,
+        pendingFinalizeBlockerIssueIds: [blockerId],
+      });
+    });
+
+    it("keeps another done blocker on the shared workspace waiting for its own save", async () => {
+      const { companyId, executionWorkspaceId, blockerId, dependentId, foreignIssueId, failedRunId, recoveryFinalize } =
+        await seedRecoveredBlocker();
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, foreignIssueId));
+      await svc.update(dependentId, { blockedByIssueIds: [blockerId, foreignIssueId] });
+      await db.insert(workspaceOperations).values([
+        { companyId, executionWorkspaceId, issueId: foreignIssueId, heartbeatRunId: failedRunId,
+          phase: "worktree_prepare", status: "succeeded", startedAt: at(69), finishedAt: at(69) },
+        recoveryFinalize(failedRunId, at(70)),
+      ]);
+
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: false,
+        pendingFinalizeBlockerIssueIds: [foreignIssueId],
+      });
     });
   });
 
