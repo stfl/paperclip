@@ -293,6 +293,45 @@ export function createGitRemoteAuthProvider(
   };
 }
 
+/** The config path of the binding row, and the top-level adapterConfig key that holds it. */
+export const AGENT_GITHUB_TOKEN_CONFIG_PATH = "access.GH_TOKEN";
+
+/**
+ * The company secret an agent binds API-only at the top-level adapterConfig key
+ * `access.GH_TOKEN`: the binding agents use to reach GitHub with the company's GitHub App
+ * installation token. Saving the agent writes a `company_secret_bindings` row for it, which the
+ * secret store requires on every read. Null when the agent carries none, or one that is not a
+ * secret reference.
+ */
+export function agentGitHubTokenBinding(
+  adapterConfig: unknown,
+): { secretId: string; version: number | "latest" } | null {
+  const binding = adapterConfig && typeof adapterConfig === "object"
+    ? (adapterConfig as Record<string, unknown>)[AGENT_GITHUB_TOKEN_CONFIG_PATH]
+    : null;
+  if (!binding || typeof binding !== "object") return null;
+  const { type, secretId, version } = binding as Record<string, unknown>;
+  if (type !== "secret_ref" || typeof secretId !== "string" || !secretId) return null;
+  return {
+    secretId,
+    version: typeof version === "number" && Number.isInteger(version) && version > 0 ? version : "latest",
+  };
+}
+
+/**
+ * A sandbox run has no host GitHub to fall back on, so an agent that binds the token and has no
+ * GitHub connection of the company reaches GitHub through the managed broker. A connection
+ * keeps priority, and a local or ssh run keeps the host's GitHub.
+ */
+export function withAgentGitHubTokenSelection<T extends { configured: boolean }>(
+  selection: T,
+  run: { driver: string | null | undefined; adapterConfig: unknown },
+): T | { configured: true } {
+  if (selection.configured) return selection;
+  if (["local", "ssh"].includes(run.driver ?? "local")) return selection;
+  return agentGitHubTokenBinding(run.adapterConfig) ? { configured: true } : selection;
+}
+
 export async function resolveManagedGitHubIdentitySelection(
   db: Db,
   companyId: string,
