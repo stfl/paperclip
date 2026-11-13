@@ -1148,6 +1148,9 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           run.runtimeModeResolvedAt === null && run.startedAt === null && run.processStartedAt === null &&
           run.processPid === null && run.processGroupId === null &&
           cancellation?.source === "operator" && cancellation.expected;
+        const handoffDrainOnly = run.runtimeMode !== "native" && run.status === "cancelled" &&
+          run.errorCode === "issue_reassigned" && run.resultJson?.reassignmentStopConfirmed === true &&
+          Boolean(issueRow?.assigneeAgentId) && issueRow?.assigneeAgentId !== run.agentId;
         const preDrainFacts: PreDrainFacts = {
           issueRowPresent: issueRow !== null,
           executionRunIdMatchesRun: !issueRow || !issueRow.executionRunId || issueRow.executionRunId === run.id,
@@ -1160,11 +1163,11 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it
           // queues a run.
-          executionCancellationAcknowledged:
+          executionCancellationAcknowledged: !handoffDrainOnly && (
             isAcknowledgedNativeReassignmentStop(run) ||
             (run.status === "cancelled" &&
             (queuedOperatorStop || parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
-            !interruptedQueue),
+            !interruptedQueue)),
         };
         const preDrain = decidePreDrain(preDrainFacts);
 
@@ -1183,7 +1186,8 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // agent's review participation retains its separate recovery path.
         const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.companyId, input.companyId),
-          input.resumeStrandedQueue ? undefined : eq(heartbeatRuns.agentId, run.agentId),
+          input.resumeStrandedQueue ? undefined : handoffDrainOnly && issueRow.assigneeAgentId
+            ? inArray(heartbeatRuns.agentId, [run.agentId, issueRow.assigneeAgentId]) : eq(heartbeatRuns.agentId, run.agentId),
           input.resumeStrandedQueue ? undefined : sql`${heartbeatRuns.id} <> ${run.id}`,
           or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
             sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`),
@@ -1249,7 +1253,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 
-        const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly };
+        const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly, handoffDrainOnly };
         const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
         // Explicit retry admission requires the exact source's task claim.
         // Preserve it only when the existing queue-first recovery policy
