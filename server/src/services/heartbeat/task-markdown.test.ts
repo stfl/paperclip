@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildPaperclipTaskMarkdown } from "./task-markdown.js";
+import {
+  MAX_TASK_PROMPT_DESCRIPTION_CHARS,
+  TASK_DESCRIPTION_TRUNCATED_NOTE,
+  buildPaperclipTaskMarkdown,
+} from "./task-markdown.js";
 
 const issue = {
   id: "task-1",
@@ -46,6 +50,16 @@ describe("heartbeat task markdown rendering", () => {
 
     expect(markdown).toContain(`- Title: ${JSON.stringify(title)}`);
     expect(markdown).toContain(`Issue description:\n\`\`\`\`\`text\n${description}\n\`\`\`\`\``);
+  });
+
+  it("cuts a description past the prompt budget and says so", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: { ...issue, description: "x".repeat(MAX_TASK_PROMPT_DESCRIPTION_CHARS + 1) },
+    })!;
+
+    expect(markdown).toContain("x".repeat(MAX_TASK_PROMPT_DESCRIPTION_CHARS));
+    expect(markdown).not.toContain("x".repeat(MAX_TASK_PROMPT_DESCRIPTION_CHARS + 1));
+    expect(markdown).toContain(TASK_DESCRIPTION_TRUNCATED_NOTE);
   });
 
   it("keeps the nearest six ancestors and reports omitted ancestor context", () => {
