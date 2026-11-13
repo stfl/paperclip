@@ -24,9 +24,13 @@ export interface LifecycleStore {
   pending(limit: number, now: Date): Promise<string[]>;
 }
 
+/** A host step that waits on something it can name reports that key, so a long
+ * wait becomes visible on the agent. A wait with no key stays silent. */
+export type LifecycleHostResult = "complete" | "pending" | { pending: string };
+
 export interface LifecycleDriver {
   requiredPluginIds(agent: LifecycleAgent): Promise<string[]>;
-  runHost(agent: LifecycleAgent): Promise<"complete" | "pending">;
+  runHost(agent: LifecycleAgent): Promise<LifecycleHostResult>;
   runPlugin(agent: LifecycleAgent, pluginId: string): Promise<"complete" | "pending">;
   /** Notify the scheduler only after readiness has committed. */
   onReady?(agent: LifecycleAgent): Promise<void>;

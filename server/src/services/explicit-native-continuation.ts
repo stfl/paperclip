@@ -27,14 +27,12 @@ import { activeIssueInteractionCondition } from "./issue-question-context.js";
 
 import { historicalAdapterType, isConversationAdapter } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
+import { recordedProcessIsGone } from "./recorded-process-probe.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 const terminal = ["failed", "interrupted", "timed_out", "cancelled"];
 
-function processStopped(pid: number): boolean {
-  try { process.kill(pid, 0); return false; }
-  catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
-}
+const processStopped = recordedProcessIsGone;
 
 /** Validate the whole saved queue, preserving order and original authors.
  * Call again under the task lock before adopting IDs into a new run.

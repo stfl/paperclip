@@ -2,19 +2,13 @@ import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import os from "node:os";
+import { recordedProcessIsGone } from "./recorded-process-probe.js";
 
 export const PROCESS_START_REQUESTED = "native.process_start_requested";
 export const PROCESS_IDENTITY_RECORDED = "native.process_identity_recorded";
 const LOCAL_PROCESS_STOPPED = "native.local_process_stopped";
 
-function absent(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return false;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ESRCH";
-  }
-}
+const absent = recordedProcessIsGone;
 
 /** A fresh workspace is not process containment. Bind an OS observation to
  * the original host, process birth, and launch event before accepting it. */
