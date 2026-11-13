@@ -208,7 +208,7 @@ import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { isUniqueViolation } from "../db-errors.js";
 import type { StorageService } from "../storage/types.js";
-import { validate, validateIssueMutationBody } from "../middleware/validate.js";
+import { assertSupportedQueryParameters, validate, validateIssueMutationBody } from "../middleware/validate.js";
 import * as serviceIndex from "../services/index.js";
 import { conversationDecisionReceiptsService } from "../services/conversation-decision-receipts.js";
 import { attentionHandledDetails, attentionHandledFor, type AttentionHandledFor } from "../services/attention-receipts.js";
@@ -3417,6 +3417,41 @@ const ISSUE_LIST_UUID_QUERY_PARAMS = [
 ] as const;
 
 type IssueListUuidQueryParam = (typeof ISSUE_LIST_UUID_QUERY_PARAMS)[number];
+
+export const ISSUE_LIST_QUERY_PARAMETERS: ReadonlySet<string> = new Set([
+  ...ISSUE_LIST_UUID_QUERY_PARAMS,
+  "afterId",
+  "assigneeAgentId",
+  "assigneeUserId",
+  "attention",
+  "displayStatus",
+  "excludeRoutineExecutions",
+  "hasPlanDocument",
+  "ids",
+  "inboxArchivedByUserId",
+  "includeAgentCreatedTasks",
+  "includeBlockedBy",
+  "includeBlockedInboxAttention",
+  "includeLiveDescendantSummary",
+  "includeParticipatedTasks",
+  "includePluginOperations",
+  "includeRoutineExecutions",
+  "limit",
+  "offset",
+  "oneChildPerParent",
+  "originId",
+  "originKind",
+  "originKindPrefix",
+  "parentIds",
+  "q",
+  "sortDir",
+  "sortField",
+  "status",
+  "touchedByUserId",
+  "unreadForUserId",
+  "updatedSince",
+  "view",
+]);
 
 function parseIssueListUuidQueryParams(
   query: Record<string, unknown>,
@@ -9089,6 +9124,7 @@ export function issueRoutes(
       });
       return;
     }
+    assertSupportedQueryParameters(req, ISSUE_LIST_QUERY_PARAMETERS);
     const assigneeUserFilterRaw = req.query.assigneeUserId as
       string | undefined;
     const touchedByUserFilterRaw = req.query.touchedByUserId as

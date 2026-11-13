@@ -1,6 +1,6 @@
 import type { Request, Response, NextFunction } from "express";
 import { ZodError, type ZodIssue, type ZodSchema } from "zod";
-import { unprocessable } from "../errors.js";
+import { badRequest, unprocessable } from "../errors.js";
 
 export function validate(schema: ZodSchema) {
   return (req: Request, _res: Response, next: NextFunction) => {
@@ -48,4 +48,19 @@ export function validateIssueMutationBody(schema: ZodSchema) {
     }
     next();
   };
+}
+
+/**
+ * Throws 400 naming every query parameter outside `allowed`. A route that
+ * ignores an unknown filter returns the unfiltered result as a success, which
+ * the caller cannot tell from a filter that matched.
+ */
+export function assertSupportedQueryParameters(req: Request, allowed: ReadonlySet<string>) {
+  const unsupported = Object.keys(req.query).filter((key) => !allowed.has(key)).sort();
+  if (unsupported.length > 0) {
+    throw badRequest(
+      `Unsupported query parameter${unsupported.length === 1 ? "" : "s"}: ${unsupported.join(", ")}`,
+      { unsupportedParameters: unsupported },
+    );
+  }
 }

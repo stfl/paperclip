@@ -25,6 +25,16 @@ Query parameters:
 
 Results sorted by priority.
 
+A query parameter the list does not support returns `400` and names it, so a
+misspelt or invented filter cannot return the unfiltered list as a success:
+
+```json
+{
+  "error": "Unsupported query parameter: identifier",
+  "details": { "unsupportedParameters": ["identifier"] }
+}
+```
+
 The `index` and `rows` projections include `listProjection` and return a null
 `description`. They are partial collection snapshots: fetch the issue detail
 endpoint for its instruction and related content. Company and private-task access
