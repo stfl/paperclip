@@ -402,7 +402,7 @@ describe("teamsCatalogService", () => {
         secretValues: { "agent:ceo:OPENAI_API_KEY": "sk-imported" },
       }),
       null,
-      { mode: "agent_safe", sourceCompanyId: "company-1" },
+      { mode: "agent_safe", sourceCompanyId: "company-1", agentActor: false },
     );
   });
 
