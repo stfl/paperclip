@@ -27,6 +27,7 @@ import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { signalProbeProvesGone } from "./recorded-process-probe.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
@@ -117,7 +118,7 @@ export async function validateExecutionReconciliation(input: {
     try {
       process.kill(pid, 0);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ESRCH") continue;
+      if (signalProbeProvesGone(error)) continue;
       throw conflict(
         "The previous provider's process ownership cannot be verified.",
       );

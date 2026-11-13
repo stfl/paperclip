@@ -19,21 +19,14 @@ import { issueService } from "../issues.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { buildExecutionContinuation } from "../execution-continuation.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { recordedProcessIsGone } from "../recorded-process-probe.js";
 
 export const NATIVE_SAFE_REPLACEMENT_REASON = "native_safe_replacement";
 const record = (v: unknown): Record<string, unknown> =>
   v && typeof v === "object" && !Array.isArray(v)
     ? (v as Record<string, unknown>)
     : {};
-const processAlive = (pid: number | null) => {
-  if (pid === null) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
-};
+const processAlive = (pid: number | null) => pid !== null && !recordedProcessIsGone(pid);
 
 export function nativeReplacementPending() {
   return and(

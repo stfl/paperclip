@@ -34,7 +34,8 @@ import {
   formatIssueIdentifierLink,
 } from "./heartbeat/scheduling.js";
 import { canApplyTaskWorkspaceSelectionAtAdmission, taskWorkspaceRuntimeSelectionEnabled } from "./execution-workspace-policy.js";
-import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
+import { agentExecutionStopHold, noteAgentExecutionStopHold, type AgentExecutionStopHold } from "./agent-execution-stop.js";
+import { retireStoppedProcessIdentity } from "./heartbeat/process-settlement.js";
 import {
   cancelHeartbeatNativeRun,
   terminateHeartbeatRunProcess,
@@ -3892,6 +3893,11 @@ export function heartbeatService(
         const handoff = await pendingCaseHandoffForRun(db, run.id);
         if (handoff) await recordCaseHandoffExecutionReleased(db, run.id, handoff.issueId);
       }
+      // This executor saw its adapter return and the process tree end.
+      if (latestRun?.runtimeMode === "legacy" && legacyLocalAdapterEntered && hasStoppedLocalProcessTree(latestRun)) {
+        await retireStoppedProcessIdentity(db, latestRun).catch(error =>
+          logger.warn({ err: error, runId: run.id }, "Could not retire a finished run's process identity"));
+      }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
       if (latestRun?.runtimeMode === "legacy" && ["failed", "timed_out"].includes(latestRun.status) &&
@@ -3950,6 +3956,10 @@ export function heartbeatService(
   }
 
   async function stopInvocationsForAgents(agentIds: string[], reason: string) {
+    return !await stopHoldForAgents(agentIds, reason);
+  }
+
+  async function stopHoldForAgents(agentIds: string[], reason: string): Promise<AgentExecutionStopHold | null> {
     await cancelInvocationsForAgentsInternal(agentIds, reason);
     const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
     const leasesToRelease = await db.select({ runId: environmentLeases.heartbeatRunId }).from(environmentLeases)
@@ -3961,18 +3971,21 @@ export function heartbeatService(
     for (const run of runs) {
       if (!isHeartbeatRunTerminalStatus(run.status) || liveRunExecutions.has(run.id) ||
           adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id) ||
-          (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())) return false;
+          (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())) {
+        return noteAgentExecutionStopHold(agentIds, { clause: "run_active", runId: run.id, agentId: run.agentId });
+      }
       if (needsRelease.has(run.id)) {
         // Retry incomplete cleanup after a run becomes terminal.
         await releaseEnvironmentLeasesForRun({ runId: run.id, companyId: run.companyId,
           agentId: run.agentId, status: run.status, providerResourceDisposition: "destroy" });
       }
     }
-    return agentExecutionsHaveStopped(db, agentIds);
+    return agentExecutionStopHold(db, agentIds);
   }
 
   return {
     stopInvocationsForAgents,
+    stopHoldForAgents,
     waitForRunExecutionDrain: async (
       runId: string,
       options: { timeoutMs?: number; intervalMs?: number } = {},

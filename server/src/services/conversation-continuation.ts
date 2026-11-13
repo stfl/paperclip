@@ -4,6 +4,7 @@ import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActi
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { readProcessStartedAt } from "./hot-restart.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { recordedProcessIsGone } from "./recorded-process-probe.js";
 
 // These adapters accept a conversation turn. Retrying a process or webhook can
 // replay the action itself, so those adapters retain their recovery contract.
@@ -93,12 +94,7 @@ export function conversationRecoveryActionPredicate() {
 
 /** OS liveness probes do not signal or stop the process. Unknown ownership holds. */
 function processMayBeAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
+  return !recordedProcessIsGone(pid);
 }
 
 /** A terminal conversation row does not prove that its execution authority ended.

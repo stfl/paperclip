@@ -276,6 +276,16 @@ periodic agent heartbeats to be enabled.
 A cancelled run record does not prove that execution stopped.
 The host also checks process ownership, controller leases, and environment cleanup.
 Required plugin cleanup cannot start while these checks are incomplete.
+The host starts every run process as its own user. A recorded process
+identifier that the host is not permitted to signal therefore belongs to
+another user's process and does not count as the run's. Windows is the
+exception: there a denied probe proves nothing and the check keeps waiting.
+A succeeded local run gives up its process identifiers once its process tree
+has ended. A failed, timed-out, interrupted, or cancelled run keeps them as
+stop evidence.
+The host logs the check that a stop waits for. When the wait is long, the
+agent shows that check in `lifecycleError`, and the worker retries at the pace
+of a failed step until the check passes.
 
 The worker starts after a committed command.
 A periodic scan recovers work after a process stops.

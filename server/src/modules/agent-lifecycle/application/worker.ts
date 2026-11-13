@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { LifecycleDriver, LifecycleStore, LifecycleFailure } from "./ports.js";
-import { isLifecycleWorkPending } from "../domain/policy.js";
-import { lifecycleFailureMessage } from "./failure.js";
+import { isLifecycleWaitOverdue, isLifecycleWorkPending } from "../domain/policy.js";
+import { lifecycleFailureMessage, lifecycleWaitMessage } from "./failure.js";
 
 /** Database leases protect each attempt across server processes. */
 export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDriver, reportFailure: (context: LifecycleFailure, error: unknown) => void, canRun = () => true) {
@@ -40,8 +40,12 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
         }
         if (!operation.hostComplete) {
           if (!await runStep("renew", () => store.renew(agent, owner, new Date()))) continue;
-          if (await runStep("host", () => driver.runHost(agent)) === "pending") {
-            if (!await runStep("defer", () => store.defer(agent, owner, null, new Date()))) continue;
+          const host = await runStep("host", () => driver.runHost(agent));
+          if (host !== "complete") {
+            // The wait continues either way. Reporting it also retries at the slower failure pace.
+            const waiting = typeof host === "object" && isLifecycleWaitOverdue(operation.attempts)
+              ? lifecycleWaitMessage({ ...context, stage: "host" }, host.pending) : null;
+            if (!await runStep("defer", () => store.defer(agent, owner, waiting, new Date()))) continue;
             return;
           }
           if (!await runStep("complete_host", () => store.completeHost(agent, owner))) continue;
