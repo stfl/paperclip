@@ -22,6 +22,7 @@ import {
   attachPaperclipSessionMetadataToSessionParams,
 } from "./workspaces.js";
 import { recordLegacyWorkspaceRestoreFailure } from "../legacy-execution-recovery.js";
+import { managedAiAdapterRuntime } from "../ai-connection-runtime.js";
 import { configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
 import { buildAgentIdentityEnv } from "@paperclipai/adapter-utils/server-utils";
 import { externalObjectService } from "../external-objects.js";
@@ -744,6 +745,8 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       // heartbeat run snapshot.
       const adapterContext: Record<string, unknown> = {
         ...context,
+        // Always replace wake-supplied metadata with this run's trusted home.
+        managedAiRuntime: managedAiAdapterRuntime(managedAiRuntime),
         ...(legacyQuestionResponse
           ? {
               [PAPERCLIP_WAKE_PAYLOAD_KEY]: {
