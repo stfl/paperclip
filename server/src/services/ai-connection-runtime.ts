@@ -393,6 +393,9 @@ export async function prepareManagedAiRuntime(
       .slice(0, 16);
     const identity = `${selection.grant.id}:${input.responsibleUserId ?? "shared"}:${generation}`;
     const sessionIdentity = `${selection.grant.id}:${input.responsibleUserId ?? "shared"}:${noAuth ? "no-auth" : `${credentialRef!.secretId}:${freshness!.epoch}`}`;
+    // Adapters trust these keys as the selected connection's own; only this
+    // function sets them.
+    const { managedAiRouting: _configuredRouting, managedAiConnection: _configuredConnection, ...configured } = input.config;
     return {
       sessionIdentity,
       ...(subscriptionFile && input.binding.provider === "openai" && credentialRef && freshness ? {
@@ -400,7 +403,7 @@ export async function prepareManagedAiRuntime(
           versionSelector: credentialRef.versionSelector ?? "latest" } satisfies PluginTaskCredentialWritebackBinding,
       } : {}),
       config: {
-        ...input.config,
+        ...configured,
         ...projected?.config,
         ...(routing ? { managedAiRouting: routing } : {}),
         env,
