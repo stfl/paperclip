@@ -1061,6 +1061,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               ? targetWorkspaceRealization.pathAliases
               : [],
             outboundRestorePaths: targetWorkspaceRealization?.outboundRestorePaths ?? [],
+            companyId: agent.companyId,
+            agentId: agent.id,
+            runPaths: [agentHome, asString(parseObject(context.paperclipScratch).dir, "")].filter(
+              (value): value is string => Boolean(value),
+            ),
+            repoRoots: workspaceHints.map((hint) => hint.cwd).filter((cwd): cwd is string => typeof cwd === "string"),
             homeDir: filesystemScope ? effectiveCodexHome : null,
             networkScope,
             networkAllowlist: parseLocalProcessNetworkAllowlist(config.networkAllowlist),
