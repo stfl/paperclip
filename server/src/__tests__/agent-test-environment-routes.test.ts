@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -273,6 +274,41 @@ describe("agent test-environment route", () => {
 
   afterEach(async () => {
     await unregisterTestAdapter("external_test");
+  });
+
+  describe("an agent key's configured command", () => {
+    const agentKey = { type: "agent", agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", companyId: "company-1", source: "agent_key", runId: "run-1" };
+
+    beforeEach(() => {
+      mockAgentService.getById.mockResolvedValue({ id: agentKey.agentId, companyId: "company-1" });
+    });
+
+    it.each(["codex", "/tmp/codex", "/nix/store/../tmp/codex"])("is refused when it is %s", async (command) => {
+      const app = await createApp(agentKey);
+      const res = await request(app)
+        .post("/api/companies/company-1/adapters/external_test/test-environment")
+        .send({ adapterConfig: { command } });
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toContain("an agent key may test only an adapter command in the Nix store");
+      expect(testEnvironmentSpy).not.toHaveBeenCalled();
+    });
+
+    it.runIf(realpathSync(process.execPath).startsWith("/nix/store/"))("is tested when it resolves into the Nix store", async () => {
+      const command = realpathSync(process.execPath);
+      const app = await createApp(agentKey);
+      const res = await request(app)
+        .post("/api/companies/company-1/adapters/external_test/test-environment")
+        .send({ adapterConfig: { command } });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    });
+
+    it("is not checked for the board", async () => {
+      const app = await createApp();
+      const res = await request(app)
+        .post("/api/companies/company-1/adapters/external_test/test-environment")
+        .send({ adapterConfig: { command: "codex" } });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    });
   });
 
   it("accepts a managed Dot environment without allocating an idle sandbox", async () => {
