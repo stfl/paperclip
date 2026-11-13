@@ -646,6 +646,26 @@ describe("runChildProcess", () => {
     expect(result.stdout).toBe("done");
   });
 
+  it("does not pass the server's git hardening variables to the child", async () => {
+    const server = { GIT_CONFIG_PARAMETERS: "'core.hooksPath=/dev/null'", GIT_ATTR_SOURCE: "4b825dc642cb6eb9a060e54bf8d69288fbee4904" };
+    const saved = { GIT_CONFIG_PARAMETERS: process.env.GIT_CONFIG_PARAMETERS, GIT_ATTR_SOURCE: process.env.GIT_ATTR_SOURCE };
+    Object.assign(process.env, server);
+    const script = "process.stdout.write(JSON.stringify([process.env.GIT_CONFIG_PARAMETERS ?? null, process.env.GIT_ATTR_SOURCE ?? null]))";
+    const run = (env: Record<string, string>) =>
+      runChildProcess(randomUUID(), process.execPath, ["-e", script], {
+        cwd: process.cwd(), env, timeoutSec: 5, graceSec: 1, onLog: async () => {},
+      });
+    try {
+      expect(JSON.parse((await run({})).stdout)).toEqual([null, null]);
+      expect(JSON.parse((await run({ GIT_CONFIG_PARAMETERS: "'user.name=run'", GIT_ATTR_SOURCE: "HEAD" })).stdout)).toEqual(["'user.name=run'", "HEAD"]);
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it("waits for onSpawn before sending stdin to the child", async () => {
     const spawnDelayMs = 150;
     const startedAt = Date.now();
