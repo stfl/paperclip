@@ -112,6 +112,16 @@ export function projectRoutes(db: Db) {
     );
   }
 
+  // A project workspace's cwd is where a run starts and where the server runs
+  // git, so only the board sets it.
+  function assertNoAgentWorkspaceCwdMutation(req: Request, workspacePatch: unknown) {
+    if (req.actor.type !== "agent") return;
+    if (typeof workspacePatch !== "object" || workspacePatch === null || Array.isArray(workspacePatch)) return;
+    if ((workspacePatch as Record<string, unknown>).cwd !== undefined) {
+      throw forbidden("Only the board can set the cwd of a project workspace.");
+    }
+  }
+
   async function assertProjectEnvironmentSelection(companyId: string, environmentId: string | null | undefined) {
     if (environmentId === undefined || environmentId === null) return;
     await assertEnvironmentSelectionForCompany(environmentsSvc, companyId, environmentId, {
@@ -382,6 +392,7 @@ export function projectRoutes(db: Db) {
       ],
     );
     await assertNoManagedSandboxWorkspacePath(workspace);
+    assertNoAgentWorkspaceCwdMutation(req, workspace);
     if (projectData.env !== undefined) {
       projectData.env = await secretsSvc.normalizeEnvBindingsForPersistence(
         companyId,
@@ -646,6 +657,7 @@ export function projectRoutes(db: Db) {
       req,
       collectProjectWorkspaceCommandPaths(req.body),
     );
+    assertNoAgentWorkspaceCwdMutation(req, req.body);
     await assertNoManagedSandboxWorkspacePath(req.body);
     const workspace = await svc.createWorkspace(id, req.body);
     if (!workspace) {
@@ -687,6 +699,7 @@ export function projectRoutes(db: Db) {
         req,
         collectProjectWorkspaceCommandPaths(req.body),
       );
+      assertNoAgentWorkspaceCwdMutation(req, req.body);
       await assertNoManagedSandboxWorkspacePath(req.body);
       const workspaceExists = (await svc.listWorkspaces(id)).some((workspace) => workspace.id === workspaceId);
       if (!workspaceExists) {
