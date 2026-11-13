@@ -23,10 +23,6 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 
 type Agent = "A" | "B" | "C";
 type Lane = keyof typeof LANES;
-// One run, oldest first. A run that handed the issue on carries the recovery
-// lane whose retry reason it ran with, or none for an ordinary wake; an `end`
-// run ended any other way; a `refused` run is a queued recovery wake that
-// dispatch cancelled because the assignee changed before it started.
 type Hop = { agent: Agent; recovery: Lane | null; end?: true; refused?: true };
 
 const LANES = {
@@ -47,7 +43,6 @@ const LANES = {
   },
 } as const;
 
-// A hand-over from a recovery run of `lane`; with no lane, of the issue's own.
 const cont = (agent: Agent, lane?: Lane) => ({ agent, recovery: lane ?? "own" }) as const;
 const wake = (agent: Agent): Hop => ({ agent, recovery: null });
 const ended = (agent: Agent): Hop => ({ agent, recovery: null, end: true });
@@ -67,9 +62,6 @@ describeEmbeddedPostgres("stranded sweep and hand-overs that return the issue", 
     await tempDb.cleanup();
   });
 
-  // An issue handed on from inside runs, oldest hop first; the last hop
-  // handed it to `assignee`. In `in_review`, `assignee` is also the pending
-  // stage's participant.
   async function seedHops(lane: Lane, specs: readonly HopSpec[], assignee: Agent) {
     const hops: Hop[] = specs.map((h) =>
       h.recovery === "own" ? { agent: h.agent, recovery: lane } : (h as Hop),
@@ -200,17 +192,12 @@ describeEmbeddedPostgres("stranded sweep and hand-overs that return the issue", 
     expect(issue.status).toBe(lane);
   }
 
-  // Wakes by C that hand the issue on: they count as no return and keep the
-  // chain whole, so they only push older runs out of the window.
   const wakes = (n: number) => Array.from({ length: n }, () => wake("C"));
-  // A→B→A→B, then wakes up to the window's edge: the two oldest recovery
-  // hand-overs return the issue, and `n` decides how many of them it reads.
   const pastWindow = (n: number) => [cont("A"), cont("B"), cont("A"), cont("B"), ...wakes(n)];
 
   it.each([
     { name: "A→B→A→B", lane: "in_progress", hops: [cont("A"), cont("B"), cont("A")], assignee: "B" },
     { name: "A→B→C→B→A", lane: "in_progress", hops: [cont("A"), cont("B"), cont("C"), cont("B")], assignee: "A" },
-    // An ordinary wake that only handed the issue back neither counts nor ends the chain.
     {
       name: "A→B→A→B→A, one B hop on an ordinary wake",
       lane: "in_progress",
@@ -218,23 +205,18 @@ describeEmbeddedPostgres("stranded sweep and hand-overs that return the issue", 
       assignee: "A",
     },
     { name: "todo A→B→A→B", lane: "todo", hops: [cont("A"), cont("B"), cont("A")], assignee: "B" },
-    // The reviewer's hand-over returns twice: past one honest review round.
     {
       name: "in_review P→A→P→A→P",
       lane: "in_review",
       hops: [cont("B"), wake("A"), cont("B"), wake("A")],
       assignee: "B",
     },
-    // Recovery hand-overs of another lane count: a reassignment that resets
-    // the issue to todo does not hide the loop.
     {
       name: "todo A→B→A after in_progress hand-overs",
       lane: "todo",
       hops: [cont("A", "in_progress"), cont("B", "in_progress"), cont("A")],
       assignee: "B",
     },
-    // Dispatch refused each stopped agent's immediate recovery wake once the
-    // issue moved on; those runs never started and hide nothing.
     {
       name: "todo A→B→A→B with refused immediate recoveries",
       lane: "todo",
@@ -254,7 +236,6 @@ describeEmbeddedPostgres("stranded sweep and hand-overs that return the issue", 
   it.each([
     { name: "single hop A→B", lane: "in_progress", hops: [cont("A")], assignee: "B" },
     { name: "A→B→C", lane: "in_progress", hops: [cont("A"), cont("B")], assignee: "C" },
-    // One return is tolerated.
     { name: "A→B→A", lane: "in_progress", hops: [cont("A"), cont("B")], assignee: "A" },
     { name: "A→B→A, B on an ordinary wake", lane: "in_progress", hops: [cont("A"), wake("B")], assignee: "A" },
     { name: "A→B→A→B→A on ordinary wakes", lane: "in_progress", hops: [wake("A"), wake("B"), wake("A"), wake("B")], assignee: "A" },
@@ -266,11 +247,7 @@ describeEmbeddedPostgres("stranded sweep and hand-overs that return the issue", 
       hops: [cont("A"), refused("A", "todo"), cont("B"), refused("B", "todo")],
       assignee: "A",
     },
-    // The reviewer requests changes and hands the issue to the author, who
-    // fixes it and hands it back; the reviewer's wake was lost.
     { name: "in_review P→A→P, one review round", lane: "in_review", hops: [cont("B"), wake("A")], assignee: "B" },
-    // A run that ended any other way ends the chain: the returns before it
-    // no longer count.
     {
       name: "A→B→A→B, then a run that ended, then A→B→A",
       lane: "in_progress",

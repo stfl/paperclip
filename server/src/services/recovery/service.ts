@@ -634,12 +634,7 @@ const INTERACTION_CONTINUATION_RECOVERY_GRACE_MS = 2 * 60_000;
 
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
-// One return is tolerated because a review round that lost its wake returns the
-// issue to the reviewer by design: the reviewer requests changes, the author
-// fixes them and hands the issue back.
 const RECOVERY_HANDOVER_MAX_RETURNS = 1;
-// A hand-over counts whichever sweep lane's recovery it ran in, so a loop that
-// moves the issue between lanes still counts.
 const RECOVERY_HANDOVER_RETRY_REASONS: ReadonlySet<string> = new Set([
   "assignment_recovery",
   "issue_continuation_needed",
@@ -1131,11 +1126,6 @@ export function recoveryService(
     return { consecutive, latestFinishedAt };
   }
 
-  // The chain is the issue's newest runs that ended by handing it on, whatever
-  // agents ran them; a run that ended any other way ends it. A queued run that
-  // dispatch refused because the assignee changed never started, so it neither
-  // counts nor ends the chain. A hand-over counts as a return when a recovery
-  // run made it and its agent held the issue again later.
   async function countRecoveryHandoverReturns(
     companyId: string,
     issueId: string,
