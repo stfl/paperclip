@@ -1,6 +1,10 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { buildPaperclipTaskMarkdown } from "./task-markdown.js";
+import {
+  MAX_TASK_PROMPT_DESCRIPTION_CHARS,
+  TASK_DESCRIPTION_TRUNCATED_NOTE,
+  buildPaperclipTaskMarkdown,
+} from "./task-markdown.js";
 
 const issue = {
   id: "task-1",
@@ -51,6 +55,24 @@ describe("heartbeat task markdown rendering", () => {
   ])("does not add native task clarification to adapter or standing-chat assignments: %j", ({ conversationAgentId, ...input }) => {
     expect(buildPaperclipTaskMarkdown({ issue: { ...issue, conversationAgentId }, ...input }))
       .not.toContain("Task clarification directive:");
+  });
+
+  it("cuts a description past the prompt budget and says so", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: { ...issue, description: "x".repeat(MAX_TASK_PROMPT_DESCRIPTION_CHARS + 1) },
+    })!;
+
+    expect(markdown).toContain("x".repeat(MAX_TASK_PROMPT_DESCRIPTION_CHARS));
+    expect(markdown).not.toContain("x".repeat(MAX_TASK_PROMPT_DESCRIPTION_CHARS + 1));
+    expect(markdown).toContain(TASK_DESCRIPTION_TRUNCATED_NOTE);
+  });
+
+  it("keeps a description within the prompt budget whole", () => {
+    const description = "x".repeat(MAX_TASK_PROMPT_DESCRIPTION_CHARS);
+    const markdown = buildPaperclipTaskMarkdown({ issue: { ...issue, description } })!;
+
+    expect(markdown).toContain(description);
+    expect(markdown).not.toContain(TASK_DESCRIPTION_TRUNCATED_NOTE);
   });
 
   it("tells a chat agent the person's time zone only when it is known", () => {

@@ -14,6 +14,7 @@ import { boundRunIssueIdSql } from "../run-task-binding.js";
 import { isBrowserUseConnection } from "../browser-use-client.js";
 import { restConnectorFor } from "../connectors/rest-registry.js";
 import { explicitOperatorRunIdentity } from "../run-identity.js";
+import { MAX_TASK_PROMPT_DESCRIPTION_CHARS } from "./task-markdown.js";
 import {
   type DurableChatWakeupRequest,
 } from "../durable-chat-wakeup.js";
@@ -143,8 +144,6 @@ const MAX_INLINE_WAKE_ATTACHMENTS = 20;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
-
-const MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS = 12_000;
 
 const MAX_AGENT_SESSION_MESSAGE_CHARS = 12_000;
 
@@ -2368,9 +2367,9 @@ export async function buildPaperclipWakePayload(input: {
   const issueDescription = conversationMode ? null : issueSummary?.description ?? null;
   const issueDescriptionTruncated =
     issueDescription !== null &&
-    issueDescription.length > MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS;
+    issueDescription.length > MAX_TASK_PROMPT_DESCRIPTION_CHARS;
   const inlineIssueDescription = issueDescriptionTruncated
-    ? issueDescription.slice(0, MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS)
+    ? issueDescription.slice(0, MAX_TASK_PROMPT_DESCRIPTION_CHARS)
     : issueDescription;
   const comments: Array<Record<string, unknown>> = [];
   let remainingBodyChars = MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS;

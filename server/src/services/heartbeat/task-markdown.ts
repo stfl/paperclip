@@ -5,6 +5,10 @@ import { slackChatAgentGuidance } from "../connectors/slack/agent-guidance.js";
 import type { ConversationConfirmationContext } from "../conversation-confirmation-context.js";
 import { TASK_QUESTION_GUIDANCE } from "../issue-question-context.js";
 
+export const MAX_TASK_PROMPT_DESCRIPTION_CHARS = 12_000;
+export const TASK_DESCRIPTION_TRUNCATED_NOTE =
+  "[issue description truncated; fetch the issue for the full brief]";
+
 export function buildPaperclipTaskMarkdown(input: {
   issue: {
     id: string;
@@ -315,7 +319,12 @@ export function buildPaperclipTaskMarkdown(input: {
     const description =
       input.includeDescription === false || issue.conversationAgentId ? "" : issue.description?.trim();
     if (description) {
-      lines.push("", "Issue description:", fenceTaskText(description));
+      lines.push(
+        "",
+        "Issue description:",
+        fenceTaskText(description.slice(0, MAX_TASK_PROMPT_DESCRIPTION_CHARS)),
+        ...(description.length > MAX_TASK_PROMPT_DESCRIPTION_CHARS ? [TASK_DESCRIPTION_TRUNCATED_NOTE] : []),
+      );
     }
     if (!issue.conversationAgentId && input.taskPlan?.body.trim()) {
       lines.push(
