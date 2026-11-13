@@ -24,6 +24,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { recordLegacyWorkspaceRestoreFailure, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { issueService } from "../services/issues.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { executionProjectionForRun } from "../services/execution-projection.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
@@ -14464,7 +14465,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   async function seedNativePassiveBoardResponse(
     continuationKind:
       "response_wake" | "same_agent" | "retry" = "response_wake",
-    options: { blockingWork?: boolean; repairUsed?: boolean } = {},
+    options: { blockingWork?: boolean; repairUsed?: boolean; assignmentWake?: boolean } = {},
   ) {
     const fixture = await seedStrandedIssueFixture({
       status: "in_progress",
@@ -14494,7 +14495,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     await db
       .update(agentWakeupRequests)
-      .set({
+      .set(options.assignmentWake ? {
+        status: "completed",
+        requestedByActorType: "system",
+        requestedByActorId: "issue-assignment",
+        payload: { issueId },
+      } : {
         source: "automation",
         reason: "issue_commented",
         status: "completed",
@@ -14636,6 +14642,33 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }),
     ]);
     expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it("parks a native response_wake that no response admitted instead of waking the same agent again", async () => {
+    const fixture = await seedNativePassiveBoardResponse("response_wake", { assignmentWake: true });
+    expect(await readNativeBoardResponseWaitSource(db, fixture)).toBeNull();
+    await finalizeNativeRun({ db, runId: fixture.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+    const heartbeat = heartbeatService(db);
+    for (let sweep = 0; sweep < 3; sweep += 1) {
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: fixture.companyId });
+      const recovery = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(recovery.continuationRequeued + recovery.escalated).toBe(0);
+    }
+    expect(await db.select().from(statusDecisions).where(eq(statusDecisions.runId, fixture.runId))).toEqual([
+      expect.objectContaining({ reasonCode: "response_wake_waiting_for_input", toStatus: "in_progress", applicationState: "applied" }),
+    ]);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, fixture.companyId))).toHaveLength(1);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, fixture.companyId))).toHaveLength(1);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId))).toHaveLength(0);
+    expect(await db.select().from(issues).where(eq(issues.id, fixture.issueId))).toEqual([
+      expect.objectContaining({ status: "in_progress", assigneeAgentId: fixture.agentId }),
+    ]);
+    expect(await executionProjectionForRun(db, fixture.companyId, fixture.runId))
+      .toMatchObject({ phase: "waiting_for_answer", label: "Waiting for a reply" });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, fixture.issueId));
+    expect(await executionProjectionForRun(db, fixture.companyId, fixture.runId))
+      .toMatchObject({ phase: "completed", label: "Completed" });
   });
 
   it("rejects an unfinished native response wait while the finish report is still correctable", async () => {
