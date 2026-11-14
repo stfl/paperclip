@@ -3896,12 +3896,18 @@ export function heartbeatService(
         });
       }
       if (latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {
+        // A run that reassigned its own issue leaves the new assignee's wake
+        // parked behind it; the release drain hands the issue over. Any other
+        // run re-releases only for its own agent's parked wakes.
+        const reassignmentStop = latestRun.errorCode === "issue_reassigned" &&
+          latestRun.resultJson?.reassignmentStopConfirmed === true;
         const [pending] = await db.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
-          eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+          eq(agentWakeupRequests.companyId, run.companyId),
+          reassignmentStop ? undefined : eq(agentWakeupRequests.agentId, run.agentId),
           eq(agentWakeupRequests.status, "deferred_issue_execution"),
           sql`${agentWakeupRequests.payload}->>'issueId' = ${String(latestRun.contextSnapshot?.issueId)}`,
         )).limit(1);
-        if (pending) await (pending.payload?.queuedCommentInterrupt
+        if (pending) await (pending.payload?.queuedCommentInterrupt && !reassignmentStop
           ? resumeQueuedCommentInterrupt(run.companyId, pending.id)
           : releaseIssueExecutionAndPromote(latestRun, { suppressImmediateRecovery: true })).catch(err => {
           logger.error({ err, runId: run.id }, "failed to promote legacy comment queue after cleanup");
