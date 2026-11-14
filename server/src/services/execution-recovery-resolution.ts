@@ -26,7 +26,8 @@ import {
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
-import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, recordedProcessStopAuthority } from "./remote-execution-termination.js";
+import { recordedGroupStartedAt, signalProbeProvesGone } from "./recorded-process-probe.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
@@ -105,19 +106,26 @@ export async function validateExecutionReconciliation(input: {
           : !hasRemoteTerminationReceipt(lease))) {
       throw conflict("The retained workspace environment has not confirmed that it stopped. Wait for cleanup before recording workspace repair.");
     }
-    checkLocalProcesses = leases.some(lease => lease.provider === "local");
+    checkLocalProcesses = leases.some(lease => lease.provider === "local") &&
+      await recordedProcessStopAuthority(db, run, leases) === "host";
+  } else if (run.processPid || run.processGroupId) {
+    const authority = await recordedProcessStopAuthority(db, run);
+    if (authority === "provider_unconfirmed") {
+      throw conflict("The previous execution environment has not confirmed that it stopped. Wait for cleanup before continuing.");
+    }
+    checkLocalProcesses = authority === "host";
   }
-  // A retained remote source's PIDs belong to its sandbox, not this server.
-  // Its exact lease receipts above replace host-local process probes.
-  for (const pid of checkLocalProcesses ? [
-    run.processPid,
-    run.processGroupId ? -run.processGroupId : null,
-  ] : []) {
+  // A provider environment's PIDs belong to that environment, not this server.
+  // Its lease receipts above replace host-local process probes.
+  for (const [pid, startedAt] of checkLocalProcesses ? [
+    [run.processPid, run.processStartedAt],
+    [run.processGroupId ? -run.processGroupId : null, recordedGroupStartedAt(run)],
+  ] as const : []) {
     if (!pid) continue;
     try {
       process.kill(pid, 0);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ESRCH") continue;
+      if (await signalProbeProvesGone(error, pid, startedAt)) continue;
       throw conflict(
         "The previous provider's process ownership cannot be verified.",
       );

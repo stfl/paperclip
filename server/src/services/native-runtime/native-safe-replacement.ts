@@ -19,21 +19,24 @@ import { issueService } from "../issues.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { buildExecutionContinuation } from "../execution-continuation.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { recordedProcessTreeIsGone } from "../recorded-process-probe.js";
+import { recordedProcessStopAuthority } from "../remote-execution-termination.js";
 
 export const NATIVE_SAFE_REPLACEMENT_REASON = "native_safe_replacement";
 const record = (v: unknown): Record<string, unknown> =>
   v && typeof v === "object" && !Array.isArray(v)
     ? (v as Record<string, unknown>)
     : {};
-const processAlive = (pid: number | null) => {
-  if (pid === null) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
-};
+
+async function providerProcessStopped(
+  db: Db,
+  run: typeof heartbeatRuns.$inferSelect,
+  leases: (typeof environmentLeases.$inferSelect)[],
+): Promise<boolean> {
+  if (run.processPid === null && run.processGroupId === null) return true;
+  const authority = await recordedProcessStopAuthority(db, run, leases);
+  return authority === "host" ? recordedProcessTreeIsGone(run) : authority === "provider_stopped";
+}
 
 export function nativeReplacementPending() {
   return and(
@@ -218,9 +221,7 @@ export async function reconcileSafeNativeReplacements(
           ].includes(coordinator.failureDetail.originalFailureCode)),
         predecessorFenced:
           coordinator.leaseOwner === null && run.status === "failed",
-        providerStopped:
-          !processAlive(run.processPid) &&
-          !processAlive(run.processGroupId ? -run.processGroupId : null),
+        providerStopped: await providerProcessStopped(db, run, leases),
         workspacePreserved:
           typeof workspace.cwd === "string" &&
           (await stat(workspace.cwd).then(

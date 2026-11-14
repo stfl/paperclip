@@ -22,13 +22,37 @@ export function lifecycleFailureCode(error: unknown): string | undefined {
     typeof code === "string" && (Object.hasOwn(reasons, code) || transientCodes.has(code)));
 }
 
-export function lifecycleFailureMessage(context: LifecycleFailure, error: unknown): string {
-  const phases = {
-    preparing: "Agent preparation", verifying: "Execution configuration check", pausing: "Stopping agent execution",
-    resuming: "Starting agent resources", terminating: "Stopping agent execution", cleaning_up: "Agent resource cleanup",
-  };
-  const phase = context.phase && Object.hasOwn(phases, context.phase)
+const phases = {
+  preparing: "Agent preparation", verifying: "Execution configuration check", pausing: "Stopping agent execution",
+  resuming: "Starting agent resources", terminating: "Stopping agent execution", cleaning_up: "Agent resource cleanup",
+};
+
+function phaseLabel(context: LifecycleFailure): string {
+  return context.phase && Object.hasOwn(phases, context.phase)
     ? phases[context.phase as keyof typeof phases] : "Agent setup";
+}
+
+const waits = {
+  run_active: "a run is still executing",
+  controller_lease_active: "the controller of a finished run has not released it",
+  lease_unreleased: "the environment of a previous run has not been released",
+  remote_stop_unconfirmed: "the environment of a cancelled run has not confirmed that it stopped",
+  process_alive: "a process recorded for a previous run still appears to be running",
+  native_stop_unrecorded: "a cancelled run has no record that its process stopped",
+  legacy_stop_unrecorded: "a cancelled run has no record that its process stopped",
+  finalization_owner_active: "a previous run is still being finalized",
+  finalization_controller_alive: "the controller finalizing a previous run still appears to be running",
+  finalization_owner_changed: "the finalization of a previous run changed while it was checked",
+} as const;
+
+/** The key is a driver's closed vocabulary. An unknown key is not echoed. */
+export function lifecycleWaitMessage(context: LifecycleFailure, wait: string): string {
+  const cause = Object.hasOwn(waits, wait) ? `${waits[wait as keyof typeof waits]} (${wait})` : "an earlier step has not finished";
+  return `${phaseLabel(context)} is still waiting: ${cause}. Paperclip keeps retrying. If this continues, contact your instance administrator.`;
+}
+
+export function lifecycleFailureMessage(context: LifecycleFailure, error: unknown): string {
+  const phase = phaseLabel(context);
   const step = context.stage === "plugin" ? `${phase}: required plugin step`
     : context.stage === "select_plugins" ? `${phase}: finding required plugins`
     : ["save_plugins", "complete_host", "complete_plugin", "transition"].includes(context.stage)
