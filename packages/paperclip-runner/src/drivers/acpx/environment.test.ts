@@ -106,6 +106,23 @@ describe("ACPX launch environment", () => {
     expect(createSanitizedAcpxSpawnInput(source, "pi").env).toEqual({ COPILOT_GITHUB_TOKEN: "copilot-key" });
   });
 
+  it.each(["claude", "codex"] as const)("carries the managed GitHub broker environment to %s", agent => {
+    const github = {
+      PATH: "/run/github/launcher:/bin", BASH_ENV: "/run/github/bash-env", ZDOTDIR: "/run/github/zdotdir",
+      GH_CONFIG_DIR: "/run/github/gh", PAPERCLIP_GITHUB_LAUNCHER_DIR: "/run/github/launcher",
+      PAPERCLIP_GITHUB_BROKER_URL: "http://broker.invalid/github", PAPERCLIP_GITHUB_BROKER_TOKEN: "broker-capability",
+      PAPERCLIP_GITHUB_BRIDGE_TOKEN: "bridge-capability", GH_TOKEN: "", GITHUB_TOKEN: "", PAPERCLIP_GIT_TOKEN: "",
+      GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "credential.helper", GIT_CONFIG_VALUE_0: "",
+    };
+    const env = createSanitizedAcpxSpawnInput({ ...github, UNRELATED_SECRET: "not-visible" }, agent).env;
+    expect(env).toEqual(github);
+  });
+
+  it("leaves GitHub environment out of a launch that has no managed launcher", () => {
+    const source = { PATH: "/bin", GH_TOKEN: "ambient", GITHUB_TOKEN: "ambient", PAPERCLIP_GITHUB_BROKER_TOKEN: "stray", BASH_ENV: "/ambient/env" };
+    expect(createSanitizedAcpxSpawnInput(source, "claude").env).toEqual({ PATH: "/bin" });
+  });
+
   it.each([
     ["pi", "OPENROUTER_API_KEY"], ["cursor", "CURSOR_API_KEY"],
     ["cursor", "CURSOR_AUTH_TOKEN"], ["copilot", "COPILOT_GITHUB_TOKEN"],
