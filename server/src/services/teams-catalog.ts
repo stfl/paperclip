@@ -944,6 +944,7 @@ export function teamsCatalogService(db: Db) {
       {
         mode: "agent_safe",
         sourceCompanyId: companyId,
+        agentActor: options.actor?.actorType === "agent",
       },
     );
     warnings.push(...await prepareSkillInstalls(companyId, prepared));
