@@ -311,6 +311,44 @@ describe("git workspace sync", () => {
     });
   });
 
+  it("gives a clone of a host mirror's repository the repository's own commit identity and nothing else", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-mirror-identity-"));
+    cleanupDirs.push(rootDir);
+    const repo = await createRepo(rootDir);
+    await git(repo, ["remote", "add", "origin", "file:///var/lib/agents-git/thingsboard-agent.git"]);
+    await git(repo, ["config", "user.name", "Mirror Identity"]);
+    await git(repo, ["config", "user.email", "mirror@example.invalid"]);
+    await git(repo, ["config", "alias.hostonly", "status"]);
+
+    const snapshot = await readGitWorkspaceSnapshot(repo);
+    await withShallowGitWorkspaceClone({ localDir: repo, snapshot: snapshot! }, async (cloneDir) => {
+      expect(await git(cloneDir, ["config", "--local", "--get", "user.name"])).toBe("Mirror Identity");
+      expect(await git(cloneDir, ["config", "--local", "--get", "user.email"])).toBe("mirror@example.invalid");
+      await expect(git(cloneDir, ["config", "--local", "--get", "alias.hostonly"])).rejects.toBeDefined();
+    });
+  });
+
+  it("gives a clone of a host mirror's repository no identity when the repository sets none, nor a clone of another remote", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-mirror-no-identity-"));
+    cleanupDirs.push(rootDir);
+    const repo = await createRepo(rootDir);
+    await git(repo, ["remote", "add", "origin", "file:///var/lib/agents-git/thingsboard-agent.git"]);
+    await git(repo, ["config", "--local", "--unset", "user.name"]);
+    await git(repo, ["config", "--local", "--unset", "user.email"]);
+
+    const snapshot = await readGitWorkspaceSnapshot(repo);
+    await withShallowGitWorkspaceClone({ localDir: repo, snapshot: snapshot! }, async (cloneDir) => {
+      await expect(git(cloneDir, ["config", "--local", "--get", "user.email"])).rejects.toBeDefined();
+    });
+
+    const other = await createRepo(path.join(rootDir, "other"));
+    await git(other, ["remote", "add", "origin", "https://github.com/example/repo.git"]);
+    const otherSnapshot = await readGitWorkspaceSnapshot(other);
+    await withShallowGitWorkspaceClone({ localDir: other, snapshot: otherSnapshot! }, async (cloneDir) => {
+      await expect(git(cloneDir, ["config", "--local", "--get", "user.email"])).rejects.toBeDefined();
+    });
+  });
+
   it("scrubs credentials from the origin remote before copying it", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-origin-scrub-"));
     cleanupDirs.push(rootDir);
@@ -1302,6 +1340,35 @@ describe("sanitizeGitRemoteUrl", () => {
       .toBe("git@github.com:example/repo.git");
     expect(sanitizeGitRemoteUrl("https://github.com/example/repo.git"))
       .toBe("https://github.com/example/repo.git");
+  });
+
+  it("keeps a file URL of the host's shared mirrors and no other file URL", () => {
+    expect(sanitizeGitRemoteUrl("file:///var/lib/agents-git/thingsboard-agent.git"))
+      .toBe("file:///var/lib/agents-git/thingsboard-agent.git");
+    expect(sanitizeGitRemoteUrl("file:///var/lib/agents-git/../agents/secret.git")).toBeNull();
+    expect(sanitizeGitRemoteUrl("file:///var/lib/agents-git/nested/repo.git")).toBeNull();
+    expect(sanitizeGitRemoteUrl("file:///var/lib/agents-git/repo")).toBeNull();
+    expect(sanitizeGitRemoteUrl("file://host/var/lib/agents-git/repo.git")).toBeNull();
+    expect(sanitizeGitRemoteUrl("file:///tmp/local/upstream.git")).toBeNull();
+  });
+
+  it("maps a mirror's file URL to the origin the host names for it", () => {
+    const before = process.env.PAPERCLIP_SANDBOX_MIRROR_ORIGINS;
+    process.env.PAPERCLIP_SANDBOX_MIRROR_ORIGINS = JSON.stringify({
+      "file:///var/lib/agents-git/thingsboard-agent.git": "git://10.0.10.1/thingsboard-agent.git",
+    });
+    try {
+      expect(sanitizeGitRemoteUrl("file:///var/lib/agents-git/thingsboard-agent.git"))
+        .toBe("git://10.0.10.1/thingsboard-agent.git");
+      expect(sanitizeGitRemoteUrl("file:///var/lib/agents-git/other.git"))
+        .toBe("file:///var/lib/agents-git/other.git");
+      process.env.PAPERCLIP_SANDBOX_MIRROR_ORIGINS = "not json";
+      expect(sanitizeGitRemoteUrl("file:///var/lib/agents-git/thingsboard-agent.git"))
+        .toBe("file:///var/lib/agents-git/thingsboard-agent.git");
+    } finally {
+      if (before === undefined) delete process.env.PAPERCLIP_SANDBOX_MIRROR_ORIGINS;
+      else process.env.PAPERCLIP_SANDBOX_MIRROR_ORIGINS = before;
+    }
   });
 
   it("drops every shape whose credential surface is unknown", () => {
