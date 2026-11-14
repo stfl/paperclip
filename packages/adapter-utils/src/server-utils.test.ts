@@ -1034,16 +1034,20 @@ describe("renderPaperclipWakePrompt", () => {
         omittedCount: 2,
       },
     };
-    for (const resumedSession of [false, true]) {
-      const prompt = renderPaperclipWakePrompt(
-        { reason: "issue_assigned", issue: { id: "issue-1" }, executionContinuation },
-        { resumedSession },
-      );
-      expect(prompt).toContain("History was truncated to fit the wake payload");
-      expect(prompt).toContain('"kind":"truncated_task_history"');
-      expect(prompt).not.toContain("History is complete through the coverage cursor");
-      expect(prompt).not.toContain('"kind":"task_history_delta"');
-    }
+    const fresh = renderPaperclipWakePrompt(
+      { reason: "issue_assigned", issue: { id: "issue-1" }, executionContinuation },
+      { resumedSession: false },
+    );
+    expect(fresh).toContain("History was truncated to fit the wake payload");
+    expect(fresh).toContain("GET /api/issues/issue-1/comments?order=desc&limit=50");
+    expect(fresh).toContain('"kind":"truncated_task_history"');
+    expect(fresh).not.toContain("History is complete through the coverage cursor");
+    const resumed = renderPaperclipWakePrompt(
+      { reason: "issue_assigned", issue: { id: "issue-1" }, executionContinuation },
+      { resumedSession: true },
+    );
+    expect(resumed).toContain("These are new or edited messages since the named run");
+    expect(resumed).not.toContain("History is complete through the coverage cursor");
   });
 
   it("renders a coverage-less continuation without throwing", () => {

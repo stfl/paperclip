@@ -351,6 +351,16 @@ export async function buildExecutionContinuation(input: {
     if (createdAtDiff !== 0) return createdAtDiff;
     return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
   });
+  const [{ total: commentTotal }] = await db
+    .select({ total: sql<number>`count(*)::int` })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.companyId, companyId),
+        eq(issueComments.issueId, issueId),
+      ),
+    );
+  let historyTruncated = rows.length < commentTotal;
   // Missing source rows cannot silently become a claim of complete context.
   if (originCommentIds.some((id) => !rows.some((row) => row.id === id)))
     throw new Error("continuation_source_context_missing");
@@ -375,6 +385,7 @@ export async function buildExecutionContinuation(input: {
         truncateToContinuationTextBytes(body, remainingBodyBytes).length,
       );
       bodyAllowances.set(row.id, allowed);
+      if (allowed < body.length) historyTruncated = true;
       remainingBodyBytes = Math.max(
         0,
         remainingBodyBytes - encodedContinuationTextBytes(body.slice(0, allowed)),
@@ -473,7 +484,12 @@ export async function buildExecutionContinuation(input: {
         latestRequest.body,
         EXECUTION_CONTINUATION_LIMITS.maxObjectiveEncodedBytes,
       )
-    : issue.description ?? issue.title;
+    : issue.description !== null && issue.description !== undefined
+      ? truncateToContinuationTextBytes(
+          issue.description,
+          EXECUTION_CONTINUATION_LIMITS.maxObjectiveEncodedBytes,
+        )
+      : issue.title;
   const completedWorkSummary =
     input.summary ??
     string(object(object(sourceRun?.result).nativeResult).summary) ??
@@ -647,8 +663,11 @@ export async function buildExecutionContinuation(input: {
       .filter((row) => row.status === "pending")
       .map((row) => row.id),
     coverage: {
-      kind: "full_task_history",
+      kind: historyTruncated ? "truncated_task_history" : "full_task_history",
       throughCommentId: messages.at(-1)?.id ?? null,
+      ...(historyTruncated
+        ? { omittedCount: Math.max(0, commentTotal - messages.length) }
+        : {}),
       summaryThroughCommentId: null,
     },
   };
