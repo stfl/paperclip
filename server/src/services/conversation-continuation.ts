@@ -3,7 +3,8 @@ import { and, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm"
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { readProcessStartedAt } from "./hot-restart.js";
-import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, recordedProcessStopAuthority } from "./remote-execution-termination.js";
+import { recordedGroupStartedAt, recordedProcessIsGone } from "./recorded-process-probe.js";
 
 // These adapters accept a conversation turn. Retrying a process or webhook can
 // replay the action itself, so those adapters retain their recovery contract.
@@ -92,13 +93,8 @@ export function conversationRecoveryActionPredicate() {
 }
 
 /** OS liveness probes do not signal or stop the process. Unknown ownership holds. */
-function processMayBeAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
+async function processMayBeAlive(pid: number, recordedStartedAt: Date | null): Promise<boolean> {
+  return !await recordedProcessIsGone(pid, recordedStartedAt);
 }
 
 /** A terminal conversation row does not prove that its execution authority ended.
@@ -124,10 +120,10 @@ export async function getConversationOwnershipBlocker(db: Db, companyId: string,
         sql`${heartbeatRuns.resultJson}->'workspaceRestoreRecovery'->>'schema' = 'paperclip.workspace-restore-recovery.v1'`),
     )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
   for (const { run, activeLease: leaseHeld } of candidates) {
+    const leases = await db.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run.id),
+    ));
     if (hasRequiredWorkspaceRecovery(run.resultJson)) {
-      const leases = await db.select().from(environmentLeases).where(and(
-        eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run.id),
-      ));
       const retainedIds = (run.resultJson!.workspaceRestoreRecovery as { leaseIds?: unknown }).leaseIds;
       const remoteLeases = leases.filter(lease => lease.provider !== "local");
       const remoteStopped = Array.isArray(retainedIds) && retainedIds.length > 0
@@ -143,14 +139,23 @@ export async function getConversationOwnershipBlocker(db: Db, companyId: string,
       // A separate local lease keeps the existing host process checks below.
       if (leases.every(lease => lease.provider !== "local")) continue;
     }
-    let pidAlive = run.processPid !== null && processMayBeAlive(run.processPid);
+    const authority = run.processPid !== null || run.processGroupId !== null
+      ? await recordedProcessStopAuthority(db, run, leases) : "host";
+    if (authority === "provider_unconfirmed") return {
+      runId: run.id, agentId: run.agentId, cause: "execution_owner_active",
+      nextAction: "The previous execution environment has not confirmed that it stopped. Wait for cleanup before continuing this task.",
+    };
+    // Process identifiers from a provider environment name nothing on this host.
+    const onHost = authority === "host";
+    let pidAlive = onHost && run.processPid !== null && await processMayBeAlive(run.processPid, run.processStartedAt);
     if (pidAlive && run.processStartedAt) {
       // A recycled PID cannot keep an old task blocked. An unreadable identity
       // stays conservative; the original process may still own execution.
       const observed = await readProcessStartedAt(run.processPid!).catch(() => null);
       if (observed && new Date(observed).getTime() !== run.processStartedAt.getTime()) pidAlive = false;
     }
-    const groupAlive = run.processGroupId !== null && processMayBeAlive(-run.processGroupId);
+    const groupAlive = onHost && run.processGroupId !== null &&
+      await processMayBeAlive(-run.processGroupId, recordedGroupStartedAt(run));
     if (pidAlive || groupAlive || leaseHeld) {
       return {
         runId: run.id,

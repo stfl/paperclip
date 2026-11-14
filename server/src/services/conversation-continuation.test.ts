@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { agents, companies, createDb, heartbeatRuns, issues, issueRecoveryActions, type Db } from "@paperclipai/db";
+import { agents, companies, createDb, environmentLeases, heartbeatRuns, issues, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
+import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
+import { readProcessStartedAt } from "./hot-restart.js";
+import { PROCESS_IDENTITY_RECORDED } from "./native-local-process-stop.js";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { deliverExecutionStatuses } from "./execution-status-delivery.js";
 
@@ -59,6 +62,46 @@ describePostgres("execution identity query contracts", () => {
     expect(await getConversationOwnershipBlocker(db, f.companyId, f.issueId)).toMatchObject({ runId: legacy.id });
     await db.update(heartbeatRuns).set({ processPid: null }).where(eq(heartbeatRuns.id, legacy.id));
     expect(await getConversationOwnershipBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+  it("leaves the stop of a run in a provider environment to the provider's receipt", async () => {
+    const f = await fixture();
+    // Nothing on this host has this number, so only the missing receipt can hold.
+    const remote = await run(f, { issueId: f.issueId }, null, 2_000_000_105);
+    const leaseId = randomUUID(), providerLeaseId = randomUUID();
+    await db.insert(environmentLeases).values({ id: leaseId, companyId: f.companyId, heartbeatRunId: remote.id,
+      provider: "fixture-sandbox", providerLeaseId, status: "released", releasedAt: new Date(), cleanupStatus: "success" });
+    expect(await getConversationOwnershipBlocker(db, f.companyId, f.issueId))
+      .toMatchObject({ runId: remote.id, cause: "execution_owner_active" });
+    // With the receipt, this host's process of the same number does not hold.
+    await db.update(heartbeatRuns).set({ processPid: process.pid, processGroupId: process.pid }).where(eq(heartbeatRuns.id, remote.id));
+    await db.update(environmentLeases).set({ metadata: { remoteExecutionTermination: {
+      schema: "paperclip.remote-termination.v1", companyId: f.companyId, runId: remote.id, leaseId,
+      provider: "fixture-sandbox", providerLeaseId, state: "stopped", confirmedAt: new Date().toISOString() } },
+    }).where(eq(environmentLeases.id, leaseId));
+    expect(await getConversationOwnershipBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+  it("holds on a launch recorded in a provider environment that left no lease to confirm its stop", async () => {
+    const f = await fixture();
+    const remote = await run(f, { issueId: f.issueId }, null, 2_000_000_105);
+    const identity = (targetKind: string) => appendHeartbeatRunEvent(db, { companyId: f.companyId, runId: remote.id, agentId: f.agentId,
+      eventType: PROCESS_IDENTITY_RECORDED, stream: "system", level: "info", payload: { targetKind, processPid: 2_000_000_105 } });
+    await identity("local");
+    expect(await getConversationOwnershipBlocker(db, f.companyId, f.issueId)).toBeNull();
+    await identity("remote");
+    expect(await getConversationOwnershipBlocker(db, f.companyId, f.issueId))
+      .toMatchObject({ runId: remote.id, cause: "execution_owner_active" });
+  });
+  it.skipIf(process.platform !== "linux")("holds on a denied probe of the recorded process and releases a reused number", async () => {
+    const f = await fixture();
+    const legacy = await run(f, { issueId: f.issueId }, null, process.pid);
+    const startedAt = new Date((await readProcessStartedAt(process.pid))!);
+    await db.update(heartbeatRuns).set({ processGroupId: process.pid, processStartedAt: startedAt }).where(eq(heartbeatRuns.id, legacy.id));
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("EPERM"), { code: "EPERM" }); });
+    try {
+      expect(await getConversationOwnershipBlocker(db, f.companyId, f.issueId)).toMatchObject({ runId: legacy.id });
+      await db.update(heartbeatRuns).set({ processStartedAt: new Date(0) }).where(eq(heartbeatRuns.id, legacy.id));
+      expect(await getConversationOwnershipBlocker(db, f.companyId, f.issueId)).toBeNull();
+    } finally { kill.mockRestore(); }
   });
   it("delivers canonical same-company task IDs and keeps malformed IDs private", async () => {
     const f = await fixture(), foreign = await fixture();

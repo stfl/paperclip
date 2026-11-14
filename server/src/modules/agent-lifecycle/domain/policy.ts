@@ -56,6 +56,14 @@ export function isLifecycleWorkPending(state: AgentLifecycleState): boolean {
   return ["preparing", "verifying", "pausing", "resuming", "terminating", "cleaning_up"].includes(state);
 }
 
+/** Counts claims of one operation. At the store's retry pace for a waiting step
+ * this gives a run minutes to stop before the operator is told. */
+const LIFECYCLE_WAIT_ATTEMPTS_BEFORE_REPORT = 150;
+
+export function isLifecycleWaitOverdue(attempts: number): boolean {
+  return attempts >= LIFECYCLE_WAIT_ATTEMPTS_BEFORE_REPORT;
+}
+
 export function assertAgentPurgeAllowed(agent: { lifecycleState: string }) {
   if (!["terminated", "rejected"].includes(agent.lifecycleState)) {
     throw new AgentLifecycleConflict("Complete termination before deleting the agent");

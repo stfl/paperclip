@@ -13,6 +13,8 @@ export interface AgentLifecycleOperation {
   leaseOwner?: string;
   leaseUntil?: string;
   retryAt?: string;
+  /** What a step has long been waiting for. The step is still retried; this is not a failure. */
+  wait?: string;
   attempts: number;
   responsibleUserId?: string | null;
 }
