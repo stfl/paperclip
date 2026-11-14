@@ -21,7 +21,7 @@ import type { companySkillService } from "../company-skills.js";
 import { connectionIntentService } from "../connection-intents.js";
 import { prepareConnectionInstructionDelivery } from "../connection-instructions.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "../connector-runtime.js";
-import { resolveManagedGitHubIdentitySelection } from "../git-credentials.js";
+import { resolveManagedGitHubIdentitySelection, withAgentGitHubTokenSelection } from "../git-credentials.js";
 import { resolveAssignedConnectionInstructionsForRun } from "../native-runtime/assigned-mcp-tools.js";
 import { recordFailedSkillPreparation, type NativeRunHistoricalSpan } from "../native-runtime/native-run-trace.js";
 import { collectRunFailureSecretValues } from "../run-failure-diagnostics.js";
@@ -138,7 +138,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
     !acceptedPlanWakeRoutingDecision?.suppressAcceptedContinuation
       ? [...runScopedMentionedSkillKeys, ACCEPTED_PLAN_CONVERSION_SKILL_KEY]
       : runScopedMentionedSkillKeys;
-  const githubSelection = await time("configuration_github_identity", () => resolveManagedGitHubIdentitySelection(
+  const connectionSelection = await time("configuration_github_identity", () => resolveManagedGitHubIdentitySelection(
     db,
     agent.companyId,
     {
@@ -147,6 +147,10 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       allowStandingDelegation: false,
     },
   ));
+  const githubSelection = withAgentGitHubTokenSelection(connectionSelection, {
+    driver: selectedEnvironmentForConfig?.driver,
+    adapterConfig: agent.adapterConfig,
+  });
   const useHostGitHub =
     !githubSelection.configured &&
     trustPreset.kind === "standard" &&

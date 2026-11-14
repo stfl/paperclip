@@ -220,7 +220,7 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     }
   });
 
-  async function configuration(f: Awaited<ReturnType<typeof seed>>, config: Record<string, unknown>, snapshot: Record<string, unknown> = {}, type = "paperclip_runner") {
+  async function configuration(f: Awaited<ReturnType<typeof seed>>, config: Record<string, unknown>, snapshot: Record<string, unknown> = {}, type = "paperclip_runner", environment: { id: string; driver: string; envVars: null } | null = null) {
     const [agent] = await db.update(agents).set({ adapterType: type, adapterConfig: config }).where(eq(agents.id, f.agentId)).returning();
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, scopeKind: "issue", status: "running", contextSnapshot: snapshot }).returning();
     const resolvedInstanceSettings = await instanceSettingsService(db).get();
@@ -231,12 +231,28 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
         taskProjectContext: null, routineEnvContext: { routineId: null, env: null, responsibleUserId: null } },
       config: { sourceWorkspaceConfig: config, aiBinding: undefined },
       policy: { trustPreset: { kind: "standard", preset: "standard", boundary: null, sourcePresets: {} }, useIsolatedTaskDirectory: false, explicitTaskDirectory: false },
-      environment: { selectedEnvironmentId: null, selectedEnvironmentForConfig: null,
+      environment: { selectedEnvironmentId: null, selectedEnvironmentForConfig: environment as never,
         resolvedInstanceSettings, persistedNativeExecutionInput: null },
       services: { secretsSvc: secretService(db), companySkills: companySkillService(db), appendRunEvent: vi.fn(), finalizeAiConnectionBusyDeferral: vi.fn() },
       onFailureSecretsResolved: () => {}, onManagedAiRuntimeAcquired: () => {}, onIdentityRedactorPrepared: () => {},
     }) };
   }
+
+  it("routes GitHub through the managed broker for a sandbox run of an agent that binds access.GH_TOKEN", async () => {
+    const f = await seed();
+    const sandbox = { id: randomUUID(), driver: "sandbox", envVars: null };
+    const binding = { "access.GH_TOKEN": { type: "secret_ref", secretId: randomUUID(), version: "latest" } };
+    const prepared = async (config: Record<string, unknown>, environment: typeof sandbox | null) => {
+      const result = await (await configuration(f, config, {}, "paperclip_runner", environment)).prepare();
+      if (!result.prepared) throw new Error("not prepared");
+      return result;
+    };
+    const bound = await prepared(binding, sandbox);
+    expect(bound.githubSelection).toEqual({ configured: true });
+    expect(bound.useHostGitHub).toBe(false);
+    expect((await prepared({}, sandbox)).githubSelection.configured).toBe(false);
+    expect((await prepared(binding, null)).githubSelection.configured).toBe(false);
+  });
 
   it.each(["fresh", "saved empty"])("prepares a %s native skill selection while another run holds the company cache lock", async kind => {
     const f = await seed();
