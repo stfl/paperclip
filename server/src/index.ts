@@ -189,6 +189,7 @@ type EmbeddedPostgresCtor = new (opts: {
   port: number;
   persistent: boolean;
   initdbFlags?: string[];
+  postgresFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
@@ -520,6 +521,11 @@ async function startServerWithDatabaseTeardown(
       logger.warn("Database mode is postgres but no connection string was set; falling back to embedded PostgreSQL");
     }
   
+    // The embedded server listens on no TCP port: its login is fixed, so any
+    // process that reaches the port would be a superuser. Clients connect over
+    // the unix socket in the data directory, named by the URL's `host` parameter.
+    const embeddedPostgresUrl = (embeddedPort: number, database: string) =>
+      `postgres://paperclip:paperclip@localhost:${embeddedPort}/${database}?host=${encodeURIComponent(dataDir)}`;
     const clusterVersionFile = resolve(dataDir, "PG_VERSION");
     const clusterAlreadyInitialized = existsSync(clusterVersionFile);
     const postmasterPidFile = resolve(dataDir, "postmaster.pid");
@@ -548,13 +554,13 @@ async function startServerWithDatabaseTeardown(
     const runningPid = getRunningPid();
     if (runningPid) {
       port = embeddedPostgresOwnerPort(readFileSync(postmasterPidFile, "utf8"), dataDir, runningPid);
-      const actualDataDir = await getPostgresDataDirectory(`postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`);
+      const actualDataDir = await getPostgresDataDirectory(embeddedPostgresUrl(port, "postgres"));
       if (typeof actualDataDir !== "string" || resolve(actualDataDir) !== resolve(dataDir)) {
         throw new Error("Refusing to reuse PostgreSQL: its data directory belongs to another instance.");
       }
       logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, port=${port})`);
     } else {
-      const configuredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${configuredPort}/postgres`;
+      const configuredAdminConnectionString = embeddedPostgresUrl(configuredPort, "postgres");
       try {
         const actualDataDir = await getPostgresDataDirectory(configuredAdminConnectionString);
         if (
@@ -581,6 +587,7 @@ async function startServerWithDatabaseTeardown(
           port,
           persistent: true,
           initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+          postgresFlags: ["-c", "listen_addresses="],
           onLog: appendEmbeddedPostgresLog,
           onError: appendEmbeddedPostgresLog,
         });
@@ -647,13 +654,13 @@ async function startServerWithDatabaseTeardown(
       }
     }
   
-    const embeddedAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
+    const embeddedAdminConnectionString = embeddedPostgresUrl(port, "postgres");
     const dbStatus = await ensurePostgresDatabase(embeddedAdminConnectionString, "paperclip");
     if (dbStatus === "created") {
       logger.info("Created embedded PostgreSQL database: paperclip");
     }
   
-    const embeddedConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+    const embeddedConnectionString = embeddedPostgresUrl(port, "paperclip");
     const shouldAutoApplyFirstRunMigrations = !clusterAlreadyInitialized || dbStatus === "created";
     if (shouldAutoApplyFirstRunMigrations) {
       logger.info("Detected first-run embedded PostgreSQL setup; applying pending migrations automatically");
