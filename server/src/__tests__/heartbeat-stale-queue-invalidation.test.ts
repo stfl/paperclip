@@ -266,6 +266,30 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0]?.assigneeAgentId).toBe(agentId);
   });
 
+  it("ends a Runner agent's queued comment wake before any execution once the task went to someone else", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "codex" } }).where(eq(agents.id, agentId));
+    const [issue] = await db.insert(issues).values({ companyId, title: "Commented, then handed over", status: "in_progress", assigneeAgentId: agentId }).returning();
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorUserId: "responsible-user", body: "Please look at this." }).returning();
+    const { runId, wakeupRequestId } = await seedQueuedRun({ companyId, agentId, issueId: issue.id, wakeReason: "issue_commented",
+      invocationSource: "automation", contextExtras: { source: "issue.comment", commentId: comment.id, wakeCommentId: comment.id } });
+    await db.update(issues).set({ assigneeAgentId: null, assigneeUserId: "responsible-user" }).where(eq(issues.id, issue.id));
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForCondition(async () => (await heartbeat.getRun(runId))?.status !== "queued");
+    await heartbeat.waitForRunExecutionDrain(runId);
+
+    expect(await heartbeat.getRun(runId)).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed", startedAt: null });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId)))[0]).toMatchObject({ status: "skipped" });
+    expect(countExecuteCallsForRun(runId)).toBe(0);
+    // Nothing was acquired for the run, so nothing is left to reconcile or recover.
+    expect(await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, runId))).toEqual([]);
+    expect(await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId))).toEqual([]);
+    expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0]).toMatchObject({
+      status: "in_progress", assigneeAgentId: null, assigneeUserId: "responsible-user", executionRunId: null,
+    });
+  });
+
   it.each(["preparing", "verifying", "resuming"] as const)("keeps assigned work queued through %s, including recovery with timers disabled", async lifecycleState => {
     const { companyId, agentId } = await seedCompanyAndAgent({ heartbeatConfig: { enabled: false } });
     await db.update(agents).set({ status: "paused", lifecycleState }).where(eq(agents.id, agentId));

@@ -556,6 +556,11 @@ export function createPostgresRunDispatchAdapter(
       context,
       ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
     );
+    const agentRunsOnRunner = await dbOrTx
+      .select({ adapterType: agents.adapterType })
+      .from(agents)
+      .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)))
+      .then((rows) => rows[0]?.adapterType === "paperclip_runner");
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
     const retryReason =
@@ -614,6 +619,7 @@ export function createPostgresRunDispatchAdapter(
     return {
       runId: input.runId,
       runAgentId: input.agentId,
+      agentRunsOnRunner,
       issueId,
       retryReasonKind,
       dependenciesBlocked: readiness && !readiness.isDependencyReady ? {
