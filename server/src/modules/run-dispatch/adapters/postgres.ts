@@ -933,6 +933,13 @@ export function createPostgresRunDispatchAdapter(
             ...(decision.errorCode === "execution_reconciliation_required"
               ? { executionWait: decision.details }
               : {}),
+            // A queued run that never started did no provider work. Without
+            // this evidence its cancellation counts as an unreconciled
+            // execution and holds the new owner's waiting wake.
+            ...(decision.errorCode === "issue_assignee_changed" && expectedStatus === "queued" &&
+                run.runtimeMode !== "native" && !run.startedAt && !run.processPid
+              ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }
+              : {}),
             effectiveTimeoutSec: 0,
             timeoutConfigured: false,
             timeoutSource: "stale_queued_run_gate",

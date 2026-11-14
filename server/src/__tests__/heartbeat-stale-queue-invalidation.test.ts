@@ -290,6 +290,43 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
   });
 
+  it.each([
+    { wake: "comment wake", wakeReason: "issue_commented", former: "paperclip_runner" },
+    { wake: "assignment run", wakeReason: "issue_assigned", former: "codex_local" },
+  ])("starts the new assignee once the gate has cancelled the former assignee's queued $wake", async ({ wakeReason, former: formerAdapter }) => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db.update(agents).set({ adapterType: formerAdapter, adapterConfig: { provider: "codex" } }).where(eq(agents.id, agentId));
+    const [newOwner] = await db.insert(agents).values({ companyId, name: "New owner", role: "engineer", status: "idle",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true } }, permissions: {},
+    }).returning();
+    const [issue] = await db.insert(issues).values({ companyId, title: "Queued, then handed to another agent", status: "todo", assigneeAgentId: agentId }).returning();
+    const commentWake = async () => {
+      const [comment] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorUserId: "responsible-user", body: "Please look at this." }).returning();
+      return { invocationSource: "automation" as const, contextExtras: { source: "issue.comment", commentId: comment.id, wakeCommentId: comment.id } };
+    };
+    const former = await seedQueuedRun({ companyId, agentId, issueId: issue.id, wakeReason,
+      ...(wakeReason === "issue_commented" ? await commentWake() : {}) });
+    await db.update(issues).set({ assigneeAgentId: newOwner.id }).where(eq(issues.id, issue.id));
+    // The new owner's assignment wake waits behind the former assignee's queued run.
+    await heartbeat.wakeup(newOwner.id, { source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      requestedByActorType: "system", payload: { issueId: issue.id } });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, newOwner.id)))[0])
+      .toMatchObject({ status: "deferred_issue_execution" });
+
+    await heartbeat.resumeQueuedRuns();
+    const ownerRuns = () => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, newOwner.id));
+    expect(await waitForCondition(async () => (await ownerRuns()).some((run) => countExecuteCallsForRun(run.id) === 1))).toBe(true);
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(await heartbeat.getRun(former.runId)).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed", startedAt: null });
+    expect(countExecuteCallsForRun(former.runId)).toBe(0);
+    // The fixture's adapter leaves the task open, so follow-up runs can come after this one.
+    const assignmentRuns = (await ownerRuns()).filter((run) => run.contextSnapshot?.wakeReason === "issue_assigned");
+    expect(assignmentRuns).toHaveLength(1);
+    expect(assignmentRuns[0]).toMatchObject({ status: "succeeded", invocationSource: "assignment", contextSnapshot: { issueId: issue.id } });
+    expect(countExecuteCallsForRun(assignmentRuns[0]!.id)).toBe(1);
+  });
+
   it.each(["preparing", "verifying", "resuming"] as const)("keeps assigned work queued through %s, including recovery with timers disabled", async lifecycleState => {
     const { companyId, agentId } = await seedCompanyAndAgent({ heartbeatConfig: { enabled: false } });
     await db.update(agents).set({ status: "paused", lifecycleState }).where(eq(agents.id, agentId));
