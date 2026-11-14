@@ -157,6 +157,28 @@ export function buildClaudeAcpConfig(
 }
 
 /**
+ * A run on a managed api_key AI connection is billed by that connection:
+ * metered, to its provider (Bedrock routing to aws_bedrock). This is the
+ * server's mapping for managed runtimes (heartbeat/runtime-execution.ts). The
+ * credential env the connection projects (API key or bearer token) says
+ * nothing about billing. Other runs, subscription connections included,
+ * return null and keep the env-based classification.
+ */
+function resolveManagedApiKeyBilling(
+  config: Record<string, unknown>,
+): { provider: string; biller: string; billingType: AdapterBillingType; preferRequestedModel: true } | null {
+  const connection = parseObject(config.managedAiConnection);
+  const provider = typeof connection.provider === "string" ? connection.provider.trim() : "";
+  if (connection.method !== "api_key" || !provider) return null;
+  return {
+    provider,
+    biller: parseObject(config.managedAiRouting).kind === "bedrock" ? "aws_bedrock" : provider,
+    billingType: "metered_api",
+    preferRequestedModel: true,
+  };
+}
+
+/**
  * Classify billing the same way the Claude CLI lane does so ACP runs land in
  * the cost ledger with a real provider/billingType instead of acpx/unknown.
  * Host env only counts for local execution targets; remote targets see just
@@ -165,7 +187,9 @@ export function buildClaudeAcpConfig(
 export function resolveClaudeAcpBillingIdentity(
   ctx: Pick<AdapterExecutionContext, "config"> &
     Partial<Pick<AdapterExecutionContext, "executionTarget" | "executionTransport">>,
-): { provider: string; biller: string; billingType: AdapterBillingType } {
+): { provider: string; biller: string; billingType: AdapterBillingType; preferRequestedModel?: true } {
+  const connection = resolveManagedApiKeyBilling(ctx.config);
+  if (connection) return connection;
   const envConfig = parseObject(parseObject(ctx.config).env);
   const target = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
