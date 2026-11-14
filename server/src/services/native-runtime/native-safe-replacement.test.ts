@@ -25,6 +25,7 @@ import {
   agents,
   companies,
   createDb,
+  environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
   issueRecoveryActions,
@@ -1152,6 +1153,41 @@ const support = externalDatabaseUrl
           decision,
         }),
       ).rejects.toThrow("source or task owner changed");
+    });
+    /** A released provider lease of the run. The receipt is the provider's confirmation that it stopped. */
+    async function providerLease(source: Awaited<ReturnType<typeof seed>>) {
+      const id = randomUUID(), providerLeaseId = randomUUID();
+      await db.insert(environmentLeases).values({ id, companyId: source.companyId, heartbeatRunId: source.runId,
+        provider: "fixture-sandbox", providerLeaseId, status: "released", releasedAt: new Date(), cleanupStatus: "success" });
+      return { confirmStopped: () => db.update(environmentLeases).set({ metadata: { remoteExecutionTermination: {
+        schema: "paperclip.remote-termination.v1", companyId: source.companyId, runId: source.runId, leaseId: id,
+        provider: "fixture-sandbox", providerLeaseId, state: "stopped", confirmedAt: new Date().toISOString() } },
+      }).where(eq(environmentLeases.id, id)) };
+    }
+    it("replaces a run in a provider environment on the provider's receipt, not on this host's process table", async () => {
+      const source = await seed(2);
+      // Nothing on this host has the first number; the second is this test process.
+      await db.update(heartbeatRuns).set({ processPid: 2_000_000_104 }).where(eq(heartbeatRuns.id, source.runId));
+      const lease = await providerLease(source);
+      const successors = () => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, source.runId));
+      await reconcileSafeNativeReplacements(db);
+      expect(await successors()).toHaveLength(0);
+      await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, source.runId));
+      await lease.confirmStopped();
+      await reconcileSafeNativeReplacements(db);
+      expect(await successors()).toHaveLength(1);
+    });
+    it("reconciles a run in a provider environment on the provider's receipt, not on this host's process table", async () => {
+      const source = await seed();
+      const input = { db, companyId: source.companyId, issueId: source.issueId, agentId: source.agentId, sourceRunId: source.runId,
+        decision: { runId: source.runId, providerStopped: true as const, actionOutcome: "not_performed" as const,
+          outcomeEvidence: "Verified that the fixture emitted an event only; no external action happened." } };
+      await db.update(heartbeatRuns).set({ processPid: 2_000_000_104 }).where(eq(heartbeatRuns.id, source.runId));
+      const lease = await providerLease(source);
+      await expect(validateExecutionReconciliation(input)).rejects.toThrow("has not confirmed that it stopped");
+      await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, source.runId));
+      await lease.confirmStopped();
+      await expect(validateExecutionReconciliation(input)).resolves.toMatchObject({ id: source.runId });
     });
     it("retains a reconciliation delivery across dispatch failure and invalidates stale ownership", async () => {
       const source = await seed();

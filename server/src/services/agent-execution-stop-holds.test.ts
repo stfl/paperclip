@@ -4,9 +4,13 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { agents, caseHandoffs, cases, companies, createDb, heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { logger } from "../middleware/logger.js";
-import { agentExecutionStopHold, agentExecutionsHaveStopped } from "./agent-execution-stop.js";
+import { AGENT_EXECUTION_STOP_HOLD_CLAUSES, agentExecutionStopHold, agentExecutionsHaveStopped,
+  noteAgentExecutionStopHold, rememberedAgentExecutionStopHolds } from "./agent-execution-stop.js";
+import { agentService } from "./agents.js";
+import { readProcessStartedAt } from "./hot-restart.js";
+import { lifecycleWaitMessage } from "../modules/agent-lifecycle/application/failure.js";
 import { configureAgentLifecycle, createAgentLifecycle } from "./agent-lifecycle.js";
-import { retireStoppedProcessIdentity } from "./heartbeat/process-settlement.js";
+import { retireStoppedProcessIdentity } from "./heartbeat/run-lifecycle.js";
 import type { LifecycleHostResult } from "../modules/agent-lifecycle/application/ports.js";
 import { isLifecycleWaitOverdue } from "../modules/agent-lifecycle/domain/policy.js";
 
@@ -187,15 +191,86 @@ const support = await getEmbeddedPostgresTestSupport();
     await due();
     await worker.process(agent.id);
     const overdue = await current(agent.id);
-    expect(overdue.lifecycleState).toBe("pausing");
-    expect(overdue.lifecycleError).toContain("Stopping agent execution is still waiting");
-    expect(overdue.lifecycleError).toContain("(process_alive)");
+    // A wait is not a failure: the agent carries it apart from lifecycleError.
+    expect(overdue).toMatchObject({ lifecycleState: "pausing", lifecycleError: null });
+    expect(overdue.lifecycleOperation!.wait).toContain("Stopping agent execution is still waiting");
+    expect(overdue.lifecycleOperation!.wait).toContain("(process_alive)");
     expect(overdue.lifecycleOperation).toMatchObject({ hostComplete: false });
+    expect((await agentService(db).getById(agent.id))!.lifecycleWait).toBe(overdue.lifecycleOperation!.wait);
     expect(Date.parse(overdue.lifecycleOperation!.retryAt!) - Date.now()).toBeGreaterThan(30_000);
 
     host = "complete";
     await due();
     await worker.process(agent.id);
     expect(await current(agent.id)).toMatchObject({ lifecycleState: "paused", lifecycleError: null });
+    expect((await agentService(db).getById(agent.id))!.lifecycleWait).toBeNull();
+  });
+
+  it("has a message for every check a stop can wait on", () => {
+    for (const clause of AGENT_EXECUTION_STOP_HOLD_CLAUSES) {
+      expect(lifecycleWaitMessage({ stage: "host", phase: "pausing" }, clause)).toContain(`(${clause})`);
+    }
+  });
+
+  it("names the same hold on every check while several runs hold", async () => {
+    const agent = await hire();
+    const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second));
+    const runs = [];
+    for (const second of [3, 1, 2]) {
+      runs.push(await finishedRun(agent.id, { status: "running", processPid: null, processGroupId: null,
+        processStartedAt: null, createdAt: at(second) }));
+    }
+    const info = vi.spyOn(logger, "info").mockImplementation(() => undefined);
+    for (let check = 0; check < 8; check++) {
+      expect(await agentExecutionStopHold(db, [agent.id])).toMatchObject({ clause: "run_active", runId: runs[1]!.id });
+    }
+    expect(info.mock.calls.filter(call => call[1] === "Agent execution stop is waiting")).toHaveLength(1);
+  });
+
+  it("forgets the hold of a stop that is no longer checked", () => {
+    vi.spyOn(logger, "info").mockImplementation(() => undefined);
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now + 60 * 60_000);
+    const abandoned = [randomUUID()], checked = [randomUUID()];
+    noteAgentExecutionStopHold(abandoned, { clause: "run_active" });
+    noteAgentExecutionStopHold(checked, { clause: "run_active" });
+    expect(rememberedAgentExecutionStopHolds()).toBe(2);
+    clock.mockReturnValue(now + 64 * 60_000);
+    noteAgentExecutionStopHold(checked, { clause: "run_active" });
+    expect(rememberedAgentExecutionStopHolds()).toBe(2);
+    clock.mockReturnValue(now + 68 * 60_000);
+    noteAgentExecutionStopHold(checked, { clause: "run_active" });
+    expect(rememberedAgentExecutionStopHolds()).toBe(1);
+    noteAgentExecutionStopHold(checked, null);
+    expect(rememberedAgentExecutionStopHolds()).toBe(0);
+  });
+
+  it.skipIf(process.platform !== "linux")("holds on a process the server may not signal while it has the recorded start time", async () => {
+    const agent = await hire();
+    const startedAt = new Date((await readProcessStartedAt(process.pid))!);
+    const run = await finishedRun(agent.id, { processPid: process.pid, processGroupId: process.pid, processStartedAt: startedAt });
+    probe({ [process.pid]: "EPERM", [-process.pid]: "EPERM" });
+    expect(await agentExecutionStopHold(db, [agent.id])).toMatchObject({ clause: "process_alive", runId: run.id });
+    // Another start time says the number was reused.
+    await db.update(heartbeatRuns).set({ processStartedAt: new Date(0) }).where(eq(heartbeatRuns.id, run.id));
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+    // A group that the recorded process does not lead has no recorded start time to compare.
+    await db.update(heartbeatRuns).set({ processPid: RECORDED_PID }).where(eq(heartbeatRuns.id, run.id));
+    probe({ [RECORDED_PID]: "ESRCH", [-process.pid]: "EPERM" });
+    expect(await agentExecutionStopHold(db, [agent.id])).toMatchObject({ clause: "process_alive", runId: run.id });
+  });
+
+  it.skipIf(process.platform !== "linux")("holds on a finalization controller the server may not signal while it has the recorded start time", async () => {
+    const agent = await hire();
+    const [issue] = await db.insert(issues).values({ companyId, title: "Cancelled native run" }).returning();
+    const run = await finishedRun(agent.id, { status: "cancelled", runtimeMode: "native", nativeIssueId: issue!.id,
+      processGroupId: null, processStartedAt: null });
+    await db.insert(nativeRunFinalizations).values({ companyId, issueId: issue!.id, runId: run.id, phase: "executing",
+      leaseOwner: "stopped-server", leaseExpiresAt: new Date(0), controllerPid: process.pid,
+      controllerProcessStartedAt: new Date((await readProcessStartedAt(process.pid))!) });
+    probe({ [RECORDED_PID]: "ESRCH", [process.pid]: "EPERM" });
+    expect(await agentExecutionStopHold(db, [agent.id])).toMatchObject({ clause: "finalization_controller_alive", runId: run.id });
+    await db.update(nativeRunFinalizations).set({ controllerProcessStartedAt: new Date(0) }).where(eq(nativeRunFinalizations.runId, run.id));
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
   });
 });

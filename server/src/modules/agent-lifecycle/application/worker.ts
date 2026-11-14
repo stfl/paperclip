@@ -44,7 +44,7 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
           if (host !== "complete") {
             // The wait continues either way. Reporting it also retries at the slower failure pace.
             const waiting = typeof host === "object" && isLifecycleWaitOverdue(operation.attempts)
-              ? lifecycleWaitMessage({ ...context, stage: "host" }, host.pending) : null;
+              ? { wait: lifecycleWaitMessage({ ...context, stage: "host" }, host.pending) } : null;
             if (!await runStep("defer", () => store.defer(agent, owner, waiting, new Date()))) continue;
             return;
           }

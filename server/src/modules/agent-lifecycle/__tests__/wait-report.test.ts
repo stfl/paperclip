@@ -24,7 +24,7 @@ function fixture(agent: LifecycleAgent, host: LifecycleHostResult) {
 const firstOverdue = (() => { let attempts = 1; while (!isLifecycleWaitOverdue(attempts)) attempts++; return attempts; })();
 
 describe("a lifecycle host step that keeps waiting", () => {
-  it("retries a young wait without an error", async () => {
+  it("retries a young wait without a report", async () => {
     const { store, worker } = fixture(pausing(firstOverdue - 1), { pending: "process_alive" });
     await worker.process("agent");
     expect(store.defer).toHaveBeenCalledWith(expect.anything(), expect.any(String), null, expect.any(Date));
@@ -35,8 +35,10 @@ describe("a lifecycle host step that keeps waiting", () => {
   it("reports an overdue wait with the key of what it waits for, and keeps the step pending", async () => {
     const { store, worker } = fixture(pausing(firstOverdue), { pending: "process_alive" });
     await worker.process("agent");
-    const message = store.defer.mock.calls[0]![2] as string;
-    expect(message).toBe(lifecycleWaitMessage({ stage: "host", phase: "pausing" }, "process_alive"));
+    const report = store.defer.mock.calls[0]![2] as { wait: string };
+    // A wait is reported apart from a failure, which is a plain message.
+    expect(report).toEqual({ wait: lifecycleWaitMessage({ stage: "host", phase: "pausing" }, "process_alive") });
+    const message = report.wait;
     expect(message).toContain("Stopping agent execution is still waiting");
     expect(message).toContain("(process_alive)");
     expect(store.completeHost).not.toHaveBeenCalled();

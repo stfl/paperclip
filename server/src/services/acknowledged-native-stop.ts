@@ -2,7 +2,7 @@ import { and, eq } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
-import { recordedProcessIsGone } from "./recorded-process-probe.js";
+import { recordedProcessTreeIsGone } from "./recorded-process-probe.js";
 
 /** A server-recorded run-only Stop must not manufacture a recovery incident. */
 function hasAcknowledgedNativeRunStopReceipt(run: {
@@ -47,6 +47,5 @@ export async function acknowledgedNativeStopExecutionHasStopped(db: Db, run: typ
   if (leases.some(lease => lease.provider !== "local")) return leases.every(hasRemoteTerminationReceipt);
   if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return false;
   if (!run.processPid && !run.processGroupId) return hasNativeLocalProcessStop(db, run.companyId, run.id);
-  const absent = recordedProcessIsGone;
-  return (!run.processPid || absent(run.processPid)) && (!run.processGroupId || absent(-run.processGroupId));
+  return recordedProcessTreeIsGone(run);
 }

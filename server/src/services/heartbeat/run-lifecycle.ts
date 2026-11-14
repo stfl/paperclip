@@ -41,6 +41,7 @@ import {
 import { terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "../heartbeat-run-status-payload.js";
+import { runHasPendingCaseHandoff } from "./case-handoff-lifecycle.js";
 import { randomUUID } from "node:crypto";
 import {
   and,
@@ -589,6 +590,31 @@ export async function persistHeartbeatRunProcessMetadata(
     });
     return run;
   });
+}
+
+/**
+ * The OS hands a finished process's identifiers to unrelated processes, so a
+ * run gives them up once its process tree is proven gone. The caller owns that
+ * proof; the write applies only to the identity the caller read.
+ *
+ * Only a succeeded legacy run without a pending case handoff gives them up:
+ * for every other run the recorded identity is stop evidence.
+ */
+export async function retireStoppedProcessIdentity(
+  db: Db,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "status" | "runtimeMode" | "processPid" | "processGroupId" | "processStartedAt">,
+): Promise<boolean> {
+  if (run.runtimeMode !== "legacy" || run.status !== "succeeded" ||
+      (run.processPid === null && run.processGroupId === null && run.processStartedAt === null)) return false;
+  const retired = await db.update(heartbeatRuns)
+    .set({ processPid: null, processGroupId: null, processStartedAt: null })
+    .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "succeeded"), eq(heartbeatRuns.runtimeMode, "legacy"),
+      run.processPid === null ? isNull(heartbeatRuns.processPid) : eq(heartbeatRuns.processPid, run.processPid),
+      run.processGroupId === null ? isNull(heartbeatRuns.processGroupId) : eq(heartbeatRuns.processGroupId, run.processGroupId),
+      run.processStartedAt === null ? isNull(heartbeatRuns.processStartedAt) : eq(heartbeatRuns.processStartedAt, run.processStartedAt),
+      not(runHasPendingCaseHandoff())))
+    .returning({ id: heartbeatRuns.id });
+  return retired.length > 0;
 }
 
 type SkillTestHeartbeatCompletion = {

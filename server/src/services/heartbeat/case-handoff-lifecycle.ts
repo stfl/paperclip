@@ -20,7 +20,7 @@ const LEGACY_HANDOFF_CLEANUP_VERIFIED = "legacy.case_handoff_cleanup_verified";
 const LEGACY_HANDOFF_CLEANUP_SCHEMA = "paperclip.legacy-case-handoff-cleanup.v1";
 const LEGACY_HANDOFF_CLEANUP_INTENT = "legacy.case_handoff_cleanup_intent";
 
-function localProcessAbsent(pid: number) {
+export function localProcessAbsent(pid: number) {
   try { process.kill(pid, 0); return false; }
   catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
 }
@@ -113,6 +113,8 @@ async function recoverLegacyCaseHandoffCleanup(db: Db, run: typeof heartbeatRuns
   return result.removed;
 }
 
+const PENDING_CASE_HANDOFF_STATES: (typeof caseHandoffs.$inferSelect)["state"][] = ["awaiting_release", "pending_dispatch", "delivered"];
+
 /** Kept independent of the handoff application service to avoid an issues/service cycle. */
 export async function pendingCaseHandoffForRun(db: Db, runId: string, companyId?: string) {
   const scope = companyId ?? await db.select({ companyId: heartbeatRuns.companyId }).from(heartbeatRuns)
@@ -120,8 +122,18 @@ export async function pendingCaseHandoffForRun(db: Db, runId: string, companyId?
   if (!scope) return null;
   return db.select().from(caseHandoffs).where(and(eq(caseHandoffs.companyId, scope), eq(caseHandoffs.sourceRunId, runId),
     eq(caseHandoffs.destinationKind, "agent"),
-    inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch", "delivered"])))
+    inArray(caseHandoffs.state, PENDING_CASE_HANDOFF_STATES)))
     .orderBy(caseHandoffs.createdAt).limit(1).then(rows => rows[0] ?? null);
+}
+
+/** The condition of `pendingCaseHandoffForRun` for a statement on `heartbeat_runs`,
+ * so the check and the write it guards are one statement. */
+export function runHasPendingCaseHandoff() {
+  return sql`exists (select 1 from ${caseHandoffs}
+    where ${caseHandoffs.companyId} = "heartbeat_runs"."company_id"
+      and ${caseHandoffs.sourceRunId} = "heartbeat_runs"."id"
+      and ${caseHandoffs.destinationKind} = 'agent'
+      and ${inArray(caseHandoffs.state, PENDING_CASE_HANDOFF_STATES)})`;
 }
 
 export async function assertNoCaseHandoffMutation(db: Db, runId: string, issueId: string) {

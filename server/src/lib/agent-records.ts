@@ -326,6 +326,7 @@ export function agentRecordQueries(db: Db) {
     const { lifecycleOperation, lifecycleRequiredPluginIds, ...publicRow } = row;
     return withUrlKey({
       ...publicRow,
+      lifecycleWait: lifecycleOperation?.wait ?? null,
       permissions: normalizeAgentPermissions(row.permissions),
     });
   }

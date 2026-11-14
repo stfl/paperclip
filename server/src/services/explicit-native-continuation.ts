@@ -11,7 +11,7 @@ import { readQueuedInteractionResponse } from "./queued-interaction-response.js"
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession, recordedLocalExecutionStopped } from "./native-local-process-stop.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
-import { hasRemoteTerminationReceipt, remoteLeaseCleanupScope } from "./remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, recordedProcessStopAuthority, remoteLeaseCleanupScope } from "./remote-execution-termination.js";
 import { z } from "zod";
 import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
@@ -27,12 +27,10 @@ import { activeIssueInteractionCondition } from "./issue-question-context.js";
 
 import { historicalAdapterType, isConversationAdapter } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
-import { recordedProcessIsGone } from "./recorded-process-probe.js";
+import { recordedProcessTreeIsGone } from "./recorded-process-probe.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 const terminal = ["failed", "interrupted", "timed_out", "cancelled"];
-
-const processStopped = recordedProcessIsGone;
 
 /** Validate the whole saved queue, preserving order and original authors.
  * Call again under the task lock before adopting IDs into a new run.
@@ -295,14 +293,16 @@ export async function admitExplicitNativeContinuation(input: {
     } else {
       if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return blocked("local_cleanup", "Waiting for the previous environment to finish cleanup. Your message will start automatically.");
       if (!unusedAdmission && !cancelledStartup) {
+        // No provider lease is left to confirm the stop of a process recorded in a provider environment.
+        if ((run.processPid || run.processGroupId) && await recordedProcessStopAuthority(db, run, leases) !== "host")
+          return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
         if (freshIntent && (run.processPid || run.processGroupId) && !await recordedLocalExecutionStopped(db, run))
           return blocked("process_identity_missing", "Paperclip is verifying that the previous session stopped.");
         // A missing process identity is not evidence that a provider exited.
         if (!run.processPid && !run.processGroupId &&
             !await hasNativeLocalProcessStop(db, companyId, run.id) &&
             !await hasHistoricalSuspendedNativeSession(db, run)) return blocked("process_identity_missing", "The previous run has no verified stop record. Paperclip cannot start this message yet.");
-        if (run.processPid && !processStopped(run.processPid)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
-        if (run.processGroupId && !processStopped(-run.processGroupId)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
+        if (!await recordedProcessTreeIsGone(run)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
       }
     }
     if (!remote && run.runtimeMode === "native" && run.errorCode === "native_session_cleanup_quarantined") {

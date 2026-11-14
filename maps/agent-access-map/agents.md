@@ -180,6 +180,7 @@ API: `present` — representative operation IDs:
 - `DELETE /api/agents/{id}` permanently purges an eligible terminated/rejected agent.
 - `POST /api/agents/{id}/lifecycle/retry`.
 - `GET /api/agents/{id}` returns the safe failed phase/step and action in `lifecycleError`.
+  A stop that keeps waiting is not a failure: `lifecycleWait` names the check it waits for.
 
 Agent access: `partial` — REST / native `call_api` resume under agent_config:update
 change-grant authorization; pause and termination remain board-only.
