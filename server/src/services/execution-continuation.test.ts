@@ -656,6 +656,93 @@ const support = await getEmbeddedPostgresTestSupport();
           .where(eq(issueComments.id, legacyRequestId));
       }
     });
+
+    it("says the history is truncated when the window holds less than the thread", async () => {
+      const full = await build();
+      expect(full.coverage.kind).toBe("full_task_history");
+      expect(full.coverage.omittedCount).toBeUndefined();
+      const commentIds = Array.from({ length: 60 }, () => randomUUID());
+      await db.insert(issueComments).values(
+        commentIds.map((id, index) => ({
+          id,
+          companyId,
+          issueId,
+          authorType: "agent" as const,
+          authorAgentId: agentId,
+          body: `progress ${index}`,
+          createdAt: new Date(Date.UTC(2026, 11, 7, 0, 0, 0) + index * 1000),
+        })),
+      );
+      try {
+        const envelope = await build();
+        expect(envelope.coverage.kind).toBe("truncated_task_history");
+        expect(envelope.coverage.omittedCount).toBe(
+          3 + commentIds.length - envelope.messages.length,
+        );
+        const prompt = renderPaperclipWakePrompt(
+          { executionContinuation: envelope },
+          { resumedSession: false },
+        );
+        expect(prompt).toContain("History was truncated to fit the wake payload");
+        expect(prompt).not.toContain("History is complete through the coverage cursor");
+      } finally {
+        await db
+          .delete(issueComments)
+          .where(inArray(issueComments.id, commentIds));
+      }
+    });
+
+    it("says the history is truncated when a comment is cut to its budget", async () => {
+      const longId = randomUUID();
+      await db.insert(issueComments).values({
+        id: longId,
+        companyId,
+        issueId,
+        authorType: "agent" as const,
+        authorAgentId: agentId,
+        body: "x".repeat(MAX_CONTINUATION_COMMENT_BODY_CHARS + 1),
+        createdAt: new Date(Date.UTC(2026, 11, 8, 0, 0, 0)),
+      });
+      try {
+        const envelope = await build();
+        expect(envelope.messages.find((message) => message.id === longId)?.body.length)
+          .toBe(MAX_CONTINUATION_COMMENT_BODY_CHARS);
+        expect(envelope.coverage.kind).toBe("truncated_task_history");
+        expect(envelope.coverage.omittedCount).toBe(0);
+      } finally {
+        await db.delete(issueComments).where(eq(issueComments.id, longId));
+      }
+    });
+
+    it("bounds the description the objective falls back to", async () => {
+      const bareIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: bareIssueId,
+        companyId,
+        title: "A long brief",
+        description: "<".repeat(100_000),
+        status: "in_progress",
+        assigneeAgentId: agentId,
+      });
+      try {
+        const envelope = await buildExecutionContinuation({
+          db,
+          companyId,
+          issueId: bareIssueId,
+          agentId,
+          context: { wakeReason: "issue_assigned" },
+          summary: null,
+          exposeLowTrustRaw: false,
+        });
+        expect(envelope.objectiveSource?.kind).toBe("description");
+        expect(envelope.objective.length).toBeGreaterThan(0);
+        expect(encodedBytes(envelope.objective)).toBeLessThanOrEqual(
+          MAX_CONTINUATION_OBJECTIVE_ENCODED_BYTES,
+        );
+      } finally {
+        await db.delete(issues).where(eq(issues.id, bareIssueId));
+      }
+    });
   },
 );
 

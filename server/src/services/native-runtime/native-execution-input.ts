@@ -3,6 +3,10 @@ import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel
 import { createHash } from "node:crypto";
 import { buildNativeContinuationPrompt } from "./native-continuation.js";
 import {
+  MAX_TASK_PROMPT_DESCRIPTION_CHARS,
+  TASK_DESCRIPTION_TRUNCATED_NOTE,
+} from "../heartbeat/task-markdown.js";
+import {
   caseExecutionMarkdown,
   caseProjectionBootstrapPrefix,
   caseWakeWithInstructionReference,
@@ -292,7 +296,11 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       // explicitly labeled background, but give authenticated external-chat
       // turns neutral structured fields.
       title: externalChatTurn ? "External chat follow-up" : input.issue.title,
-      description: externalChatTurn ? externalChatSkillDescription : input.issue.description,
+      description: externalChatTurn
+        ? externalChatSkillDescription
+        : typeof input.issue.description === "string" && input.issue.description.length > MAX_TASK_PROMPT_DESCRIPTION_CHARS
+          ? `${input.issue.description.slice(0, MAX_TASK_PROMPT_DESCRIPTION_CHARS)}\n${TASK_DESCRIPTION_TRUNCATED_NOTE}`
+          : input.issue.description,
       prompt: taskPrompt,
       workMode: input.issue.workMode,
     },
