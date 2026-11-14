@@ -171,7 +171,12 @@ import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { isUniqueViolation } from "../db-errors.js";
 import type { StorageService } from "../storage/types.js";
-import { validate, validateIssueMutationBody } from "../middleware/validate.js";
+import {
+  rejectUnknownIssueFields,
+  rejectUnknownQueryParameters,
+  validate,
+  validateIssueMutationBody,
+} from "../middleware/validate.js";
 import * as serviceIndex from "../services/index.js";
 import {
   accessService,
@@ -384,6 +389,51 @@ const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
+// Keys an issue update has always dropped and still accepts: GitHub Sync's own
+// PATCHes carry them, and refusing them would send it to a direct write that
+// skips the route's wakes and policy handling.
+const UPDATE_ISSUE_TOLERATED_FIELDS = ["executionState", "originKind", "originId"] as const;
+// Every query parameter the company issue list handler reads. The route
+// refuses any other, so a lookup such as `?identifier=` cannot return the
+// unfiltered list; the route test fails when the handler reads another set.
+export const ISSUE_LIST_QUERY_PARAMETERS: ReadonlySet<string> = new Set([
+  "afterId",
+  "assigneeAgentId",
+  "assigneeUserId",
+  "attention",
+  "createdFromIssueId",
+  "descendantOf",
+  "excludeRoutineExecutions",
+  "executionWorkspaceId",
+  "hasPlanDocument",
+  "inboxArchivedByUserId",
+  "includeAgentCreatedTasks",
+  "includeBlockedBy",
+  "includeBlockedInboxAttention",
+  "includeLiveDescendantSummary",
+  "includeParticipatedTasks",
+  "includePluginOperations",
+  "includeRoutineExecutions",
+  "labelId",
+  "limit",
+  "offset",
+  "originId",
+  "originKind",
+  "originKindPrefix",
+  "parentId",
+  "parentIssueId",
+  "participantAgentId",
+  "projectId",
+  "q",
+  "sortDir",
+  "sortField",
+  "status",
+  "touchedByUserId",
+  "unreadForUserId",
+  "updatedSince",
+  "view",
+  "workspaceId",
+]);
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),
@@ -8246,7 +8296,7 @@ export function issueRoutes(
     res.json(summaries);
   });
 
-  router.get("/companies/:companyId/issues", async (req, res) => {
+  router.get("/companies/:companyId/issues", rejectUnknownQueryParameters(ISSUE_LIST_QUERY_PARAMETERS), async (req, res) => {
     const startedAt = Date.now();
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -12192,6 +12242,7 @@ export function issueRoutes(
   router.post(
     "/companies/:companyId/issues",
     applyCreateIssueStatusDefault,
+    rejectUnknownIssueFields(createIssueSchema),
     validateIssueMutationBody(createIssueSchema),
     async (req, res) => {
       const companyId = req.params.companyId as string;
@@ -12727,6 +12778,7 @@ export function issueRoutes(
   router.post(
     "/issues/:id/children",
     applyCreateIssueStatusDefault,
+    rejectUnknownIssueFields(createChildIssueSchema),
     validateIssueMutationBody(createChildIssueSchema),
     async (req, res) => {
       const parentId = req.params.id as string;
@@ -12984,6 +13036,7 @@ export function issueRoutes(
 
   router.post(
     "/issues/:id/accepted-plan-decompositions",
+    rejectUnknownIssueFields(createAcceptedPlanDecompositionSchema),
     validateIssueMutationBody(createAcceptedPlanDecompositionSchema),
     async (req, res) => {
       const sourceIssueId = req.params.id as string;
@@ -13617,6 +13670,7 @@ export function issueRoutes(
       }
       next();
     },
+    rejectUnknownIssueFields(updateIssueRouteSchema, UPDATE_ISSUE_TOLERATED_FIELDS),
     validateIssueMutationBody(updateIssueRouteSchema),
     async (req, res) => {
       // Snapshot-guarded writes are policy-only. Do not admit task-control
