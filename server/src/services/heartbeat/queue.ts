@@ -222,6 +222,8 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 
 export const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+/** How long a handoff wake waits for the handing-off run's process and lease. */
+const HANDOFF_WAIT_LIMIT_MS = 10 * 60_000;
 
 export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -1790,9 +1792,101 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return cancelled;
   }
 
+  /**
+   * Re-dispatch same-issue handoff wakes (review stage, changes requested,
+   * reassignment) that were saved while the run that requested the handoff
+   * still owned its process or environment lease. A stop without the
+   * reassignment marker, or a lease still held when the stopped run's cleanup
+   * drains, leaves no release that promotes the saved wake. Once the ownership
+   * blocker is gone, the saved receipt re-enters ordinary admission, which
+   * applies every gate again (assignee/status guard, holds, budgets). A
+   * receipt still blocked after HANDOFF_WAIT_LIMIT_MS becomes the skipped
+   * reconciliation receipt admission would have written, so a lease that never
+   * releases leaves the issue to the stranded-work sweep instead of a live
+   * path that never starts. Returns how many receipts are still waiting.
+   */
+  async function resumeHandoffWakes(scope: { companyId?: string; sourceRunId?: string } = {}) {
+    if ((await getSchedulingSuppression()).suppressed) return 0;
+    const waiting = await db.select({ wake: agentWakeupRequests }).from(agentWakeupRequests)
+      .innerJoin(companies, and(eq(companies.id, agentWakeupRequests.companyId), eq(companies.status, "active")))
+      .where(and(
+        scope.companyId ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload} #>> '{executionWait,cause}' = 'execution_owner_active'`,
+        scope.sourceRunId
+          ? sql`${agentWakeupRequests.payload} #>> '{executionWait,runId}' = ${scope.sourceRunId}`
+          : and(sql`${agentWakeupRequests.payload} #>> '{executionWait,runId}' is not null`,
+            lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000))),
+      )).orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
+    let pending = 0;
+    for (const { wake } of waiting) {
+      const savedPayload = parseObject(wake.payload);
+      const issueId = readNonEmptyString(savedPayload.issueId);
+      if (!issueId || !isUuidLike(issueId)) continue;
+      const blocker = await getExecutionBlocker(db, wake.companyId, issueId);
+      if (blocker && wake.requestedAt.getTime() < Date.now() - HANDOFF_WAIT_LIMIT_MS) {
+        await db.update(agentWakeupRequests).set({
+          status: "skipped", reason: "execution_reconciliation_required", error: blocker.nextAction,
+          finishedAt: new Date(), updatedAt: new Date(),
+        }).where(and(
+          eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.id, wake.id),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ));
+        continue;
+      }
+      if (blocker) {
+        pending += 1;
+        await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+          eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.id, wake.id),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ));
+        continue;
+      }
+      const now = new Date();
+      // Claim the receipt so concurrent sweeps cannot dispatch it twice.
+      const [claimed] = await db.update(agentWakeupRequests).set({
+        status: "cancelled", finishedAt: now, updatedAt: now,
+        error: "Re-dispatched after the handing-off run released its lease",
+      }).where(and(
+        eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.id, wake.id),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      )).returning({ id: agentWakeupRequests.id });
+      if (!claimed) continue;
+      const payload = { ...savedPayload };
+      const contextSnapshot = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
+      delete payload.executionWait;
+      delete payload[DEFERRED_WAKE_CONTEXT_KEY];
+      try {
+        // A blocker that reappears saves a fresh receipt through the same
+        // deferral, because the payload keeps its interruptedRunId.
+        await enqueueWakeup(wake.agentId, {
+          source: wake.source as WakeupOptions["source"],
+          triggerDetail: (wake.triggerDetail ?? undefined) as WakeupOptions["triggerDetail"],
+          reason: wake.reason ?? undefined,
+          payload, contextSnapshot,
+          requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+          requestedByActorId: wake.requestedByActorId ?? undefined,
+          issueStateGuard: { assigneeAgentId: wake.agentId, statuses: ["todo", "in_progress", "in_review", "blocked"] },
+          idempotencyKey: `handoff-redispatch:${wake.id}`,
+        });
+      } catch (err) {
+        await db.update(agentWakeupRequests).set({
+          status: "deferred_issue_execution", finishedAt: null, error: null, updatedAt: new Date(),
+        }).where(and(
+          eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.id, wake.id),
+          eq(agentWakeupRequests.status, "cancelled"),
+        ));
+        pending += 1;
+        logger.warn({ err, requestId: wake.id }, "failed to re-dispatch handoff wake after cleanup");
+      }
+    }
+    return pending;
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
+    await resumeHandoffWakes();
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
@@ -3275,7 +3369,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           ) => {
             if (caseRequest) waitForCaseAdmission("execution_reconciliation_required", executionBlocker.nextAction);
             opts.issueStateGuard?.onExecutionDeferred?.(executionBlocker.cause);
-            const condition = { recoveryActionId: executionBlocker.recoveryActionId, ...continuationWait };
+            // A same-issue handoff (review stage, changes requested, reassignment)
+            // stops the run that requested it before waking the next owner. That
+            // run's process/lease teardown is transient, not uncertain work: keep
+            // the wake durable so cleanup completion dispatches it instead of
+            // recording a diagnostic receipt that nothing ever retries. The
+            // stopped run must be another agent's: a stop of the woken agent's
+            // own run (a board interrupt) keeps an operator Stop's protection.
+            const handoffRunId = readNonEmptyString(payload?.interruptedRunId)
+              ?? readNonEmptyString(enrichedContextSnapshot.interruptedRunId);
+            const awaitsHandoffCleanup = executionBlocker.cause === "execution_owner_active" &&
+              !executionBlocker.recoveryActionId && Boolean(handoffRunId) && executionBlocker.runId === handoffRunId &&
+              Boolean(executionBlocker.agentId) && executionBlocker.agentId !== agentId;
+            const condition = { recoveryActionId: executionBlocker.recoveryActionId, ...continuationWait,
+              ...(awaitsHandoffCleanup ? { cause: executionBlocker.cause, runId: handoffRunId } : {}) };
             if (executionWaitRequestId) {
               await tx.update(agentWakeupRequests).set({
                 payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}', ${JSON.stringify(condition)}::jsonb)`,
@@ -3283,7 +3390,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               }).where(eq(agentWakeupRequests.id, executionWaitRequestId));
               return { kind: "deferred" as const };
             }
-            if (durableRequest || wakeCommentId ||
+            if (durableRequest || wakeCommentId || awaitsHandoffCleanup ||
                 hasInteractionContinuationWakeContext(enrichedContextSnapshot) ||
                 readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId)) {
               await tx.insert(agentWakeupRequests).values({
@@ -4887,6 +4994,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     withChatControlRecoveryGate,
     trackWakeup,
     resumeQueuedRuns,
+    resumeHandoffWakes,
     parseHeartbeatPolicy,
     claimDueTimerHeartbeat,
   };
