@@ -261,8 +261,9 @@ history retains the original error so reconciliation and live delivery agree.
 
 The server writes `native.local_process_stopped` in the same transaction that
 clears a local run's process identity, after it verifies that its PID and process
-group are absent. The payload contains only those process IDs. Remote process
-IDs are never checked against the control-plane host.
+group are absent. The payload contains only those process IDs and the start
+time recorded for the process. Remote process IDs are never checked against the
+control-plane host.
 
 The server writes `native.process_start_requested` before a backend can spawn,
 and `native.process_identity_recorded` when it stores a new native process
