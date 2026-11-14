@@ -108,7 +108,7 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp() {
+async function createApp(actor?: Record<string, unknown>) {
   const [{ projectRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/projects.js")>("../routes/projects.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -117,7 +117,7 @@ async function createApp() {
   app.use(express.json());
   app.use((req, _res, next) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (req as any).actor = {
+    (req as any).actor = actor ?? {
       type: "board",
       userId: "board-user",
       companyIds: ["company-1"],
@@ -300,6 +300,57 @@ describe("project workspace host-path floor", () => {
     // The floor runs before the project row is written, so nothing is orphaned.
     expect(mockProjectService.create).not.toHaveBeenCalled();
     expect(mockProjectService.createWorkspace).not.toHaveBeenCalled();
+  });
+
+  describe("an agent key", () => {
+    const agentKey = { type: "agent", agentId: "agent-1", companyId: "company-1", source: "agent_key", runId: "run-1" };
+
+    beforeEach(() => {
+      // An agent key resolves a project reference by its URL key against the company's projects.
+      mockProjectService.list.mockResolvedValue([]);
+    });
+
+    it("cannot set the cwd of a new project workspace", async () => {
+      const app = await createApp(agentKey);
+      const res = await request(app)
+        .post("/api/projects/project-1/workspaces")
+        .send({ name: "Primary", cwd: "/srv/projects/paperclip" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Only the board can set the cwd of a project workspace.");
+      expect(mockProjectService.createWorkspace).not.toHaveBeenCalled();
+    });
+
+    it("cannot set or clear the cwd of a project workspace", async () => {
+      const app = await createApp(agentKey);
+      for (const cwd of ["/srv/projects/paperclip", null]) {
+        const res = await request(app)
+          .patch("/api/projects/project-1/workspaces/workspace-1")
+          .send({ cwd });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+      }
+      expect(mockProjectService.updateWorkspace).not.toHaveBeenCalled();
+    });
+
+    it("cannot set the cwd of the workspace nested in a new project", async () => {
+      const app = await createApp(agentKey);
+      const res = await request(app)
+        .post("/api/companies/company-1/projects")
+        .send({ name: "Project", workspace: { name: "Primary", cwd: "/srv/projects/paperclip" } });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockProjectService.create).not.toHaveBeenCalled();
+    });
+
+    it("can still create a workspace with only a repo URL", async () => {
+      const app = await createApp(agentKey);
+      const res = await request(app)
+        .post("/api/projects/project-1/workspaces")
+        .send({ name: "Primary", repoUrl: "https://github.com/paperclipai/paperclip" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+    });
   });
 
   it("accepts a nested workspace with only a repo URL when the policy is on", async () => {
