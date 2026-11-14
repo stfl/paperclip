@@ -74,6 +74,12 @@ import {
   closeLivenessDb,
 } from "@paperclipai/db";
 import detectPort from "detect-port";
+import {
+  describeListenTarget,
+  isListenStrict,
+  resolveListenTarget,
+  takeSystemdListenFd,
+} from "./listen-target.js";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
@@ -238,6 +244,7 @@ export async function startServer(): Promise<StartedServer> {
 async function startServerWithDatabaseTeardown(
   startupDatabase: StartupDatabaseTeardown,
 ): Promise<StartedServer> {
+  const systemdListenFd = takeSystemdListenFd();
   setStartupRecoveryPhase("starting");
   warnIfUnsupportedNodeVersion(process.versions.node, (message) => logger.warn(message));
 
@@ -721,10 +728,14 @@ async function startServerWithDatabaseTeardown(
   }
 
   const requestedListenPort = config.port;
-  const listenPort = await detectPort({
+  const listenTarget = await resolveListenTarget({
+    host: config.host,
     port: requestedListenPort,
-    hostname: config.host,
+    inheritedFd: systemdListenFd,
+    strict: isListenStrict(),
+    detectPort,
   });
+  const listenPort = listenTarget.port;
   if (config.authBaseUrlMode === "explicit" && config.authPublicBaseUrl) {
     config.authPublicBaseUrl = rewriteLoopbackUrlPort(config.authPublicBaseUrl, listenPort);
   }
@@ -1049,13 +1060,18 @@ async function startServerWithDatabaseTeardown(
       rejectListen(err);
     };
     server.once("error", onError);
-    server.listen(listenPort, config.host, () => {
+    const onListening = () => {
       server.off("error", onError);
       logger.info(
-        `Server listener bound on ${config.host}:${listenPort}; startup recovery in progress`,
+        `Server listener bound on ${describeListenTarget(listenTarget)}; startup recovery in progress`,
       );
       resolveListen();
-    });
+    };
+    if (listenTarget.kind === "inherited-fd") {
+      server.listen({ fd: listenTarget.fd }, onListening);
+    } else {
+      server.listen(listenTarget.port, listenTarget.host, onListening);
+    }
   });
   startupListenerBound = true;
 
