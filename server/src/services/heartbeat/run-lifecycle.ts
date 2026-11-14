@@ -555,6 +555,32 @@ function buildRunEventRuntimeProgress(input: {
   };
 }
 
+function isTransientRunWriteConflict(error: unknown) {
+  let current = error;
+  for (let depth = 0; current && typeof current === "object" && depth < 4; depth++) {
+    const code = (current as { code?: unknown }).code;
+    if (code === "40P01" || code === "40001") return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
+ * Spawn identity is the run's ownership proof. A deadlock victim or
+ * serialization failure rolled back cleanly, so the whole write is retried
+ * instead of failing a live provider session.
+ */
+export async function retryTransientRunWrite<T>(write: () => Promise<T>, attempts = 4): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await write();
+    } catch (error) {
+      if (attempt >= attempts || !isTransientRunWriteConflict(error)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 20 * attempt));
+    }
+  }
+}
+
 export async function persistHeartbeatRunProcessMetadata(
   db: Db,
   runId: string,
@@ -565,29 +591,33 @@ export async function persistHeartbeatRunProcessMetadata(
     () => null,
   );
   const startedAt = new Date(observedStartedAt ?? meta.startedAt);
+  const processStartedAt = Number.isNaN(startedAt.getTime()) ? new Date() : startedAt;
   return db.transaction(async tx => {
-    const run = await tx
-      .update(heartbeatRuns)
-      .set({
-        processPid: meta.pid,
-        processGroupId: meta.processGroupId,
-        processStartedAt: Number.isNaN(startedAt.getTime())
-          ? new Date()
-          : startedAt,
-        updatedAt: new Date(),
-      })
+    const [binding] = await tx
+      .select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
-      .returning()
-      .then((rows) => rows[0] ?? null);
-    if (run) await appendHeartbeatRunEvent(tx as unknown as Db, {
-      companyId: run.companyId, runId, agentId: run.agentId,
+      .limit(1);
+    if (!binding) return null;
+    // One UPDATE writes the identity and reserves the event sequence. Updating
+    // the row twice here re-checks its foreign keys and can wait behind (or
+    // deadlock with) any transaction holding the agent, issue, or predecessor
+    // run FOR UPDATE, which failed spawn persistence and lost the run.
+    await appendHeartbeatRunEvent(tx as unknown as Db, {
+      companyId: binding.companyId, runId, agentId: binding.agentId,
       eventType: PROCESS_IDENTITY_RECORDED, stream: "system", level: "info",
       message: "Process identity recorded; prior stop evidence no longer applies.",
       payload: { targetKind: meta.targetKind ?? "local", hostname: os.hostname(),
         processPid: meta.pid, processGroupId: meta.processGroupId,
-        processStartedAt: run.processStartedAt?.toISOString() ?? null },
+        processStartedAt: processStartedAt.toISOString() },
+      runUpdate: {
+        processPid: meta.pid,
+        processGroupId: meta.processGroupId,
+        processStartedAt,
+      },
     });
-    return run;
+    return tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
   });
 }
 
@@ -2147,7 +2177,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     runId: string,
     meta: { pid: number; processGroupId: number | null; startedAt: string; targetKind?: "local" | "remote" },
   ) {
-    return persistHeartbeatRunProcessMetadata(db, runId, meta);
+    return retryTransientRunWrite(() => persistHeartbeatRunProcessMetadata(db, runId, meta));
   }
 
   async function clearDetachedRunWarning(runId: string) {
