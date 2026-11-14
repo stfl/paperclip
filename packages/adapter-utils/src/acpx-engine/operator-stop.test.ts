@@ -78,15 +78,12 @@ it.each(['missing session', 'changed configuration'])('starts a new turn when th
   const result = await running;
   expect(result.executionRecovery?.kind).toBe('interrupted');
   if (change === 'missing session') await fs.rm(path.join(root, 'session'));
-  let next = await execute({ ...ctx, signal: undefined,
+  const next = await execute({ ...ctx, signal: undefined,
     config: change === 'changed configuration' ? { ...ctx.config, env: { ...(ctx.config.env as object), SETTING: 'changed' } } : ctx.config,
     runtime: { ...ctx.runtime, sessionParams: sessionCodec.serialize(result.sessionParams ?? null) },
   });
-  if (change === 'missing session') {
-    expect(next.clearSession, JSON.stringify(next)).toBe(true);
-    next = await execute({ ...ctx, runId: 'fresh-follow-up', signal: undefined,
-      runtime: { ...ctx.runtime, sessionParams: null } });
-  }
+  // The same run replaces a session it cannot resume with a fresh one.
+  if (change === 'missing session') expect(next.sessionId).not.toBe(result.sessionId);
   expect(next.exitCode, JSON.stringify(next)).toBe(0);
   expect((await fs.readFile(path.join(root, 'prompts'), 'utf8')).trim().split('\n')).toHaveLength(2);
 });
