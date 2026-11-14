@@ -2,19 +2,11 @@ import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import os from "node:os";
+import { recordedProcessIsGone, recordedProcessTreeIsGone } from "./recorded-process-probe.js";
 
 export const PROCESS_START_REQUESTED = "native.process_start_requested";
 export const PROCESS_IDENTITY_RECORDED = "native.process_identity_recorded";
 const LOCAL_PROCESS_STOPPED = "native.local_process_stopped";
-
-function absent(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return false;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ESRCH";
-  }
-}
 
 /** A fresh workspace is not process containment. Bind an OS observation to
  * the original host, process birth, and launch event before accepting it. */
@@ -27,8 +19,7 @@ export async function recordedLocalExecutionStopped(db: Db, run: typeof heartbea
   if (recorded?.targetKind !== "local" || recorded.hostname !== os.hostname() ||
       recorded.processPid !== run.processPid || recorded.processGroupId !== run.processGroupId ||
       !run.processStartedAt || recorded.processStartedAt !== run.processStartedAt.toISOString()) return false;
-  return Boolean(run.processPid && absent(run.processPid) &&
-    (!run.processGroupId || absent(-run.processGroupId)));
+  return Boolean(run.processPid) && recordedProcessTreeIsGone(run);
 }
 
 /**
@@ -45,8 +36,7 @@ export async function recordNativeLocalProcessStop(db: Db, run: typeof heartbeat
       eq(environmentLeases.heartbeatRunId, run.id),
     ));
   if (leases.some(lease => lease.provider !== "local")) return false;
-  if ((run.processPid && !absent(run.processPid)) ||
-      (run.processGroupId && !absent(-run.processGroupId))) return false;
+  if (!await recordedProcessTreeIsGone(run)) return false;
   await appendHeartbeatRunEvent(db, {
     companyId: run.companyId,
     runId: run.id,
@@ -55,7 +45,8 @@ export async function recordNativeLocalProcessStop(db: Db, run: typeof heartbeat
     stream: "system",
     level: "info",
     message: "Recovery verified the local process stopped before clearing its identity.",
-    payload: { processPid: run.processPid, processGroupId: run.processGroupId },
+    payload: { processPid: run.processPid, processGroupId: run.processGroupId,
+      processStartedAt: run.processStartedAt?.toISOString() ?? null },
   });
   return true;
 }
@@ -117,6 +108,11 @@ export async function readNativeLocalProcessStop(db: Db, companyId: string, runI
   const pid = event?.payload?.processPid;
   const group = event?.payload?.processGroupId;
   if (event?.eventType !== LOCAL_PROCESS_STOPPED || typeof pid !== "number" ||
-      !Number.isSafeInteger(pid) || pid <= 1 || group !== pid || !absent(pid) || !absent(-pid)) return null;
+      !Number.isSafeInteger(pid) || pid <= 1 || group !== pid) return null;
+  // A receipt without a start time cannot tell a reused identifier from the
+  // recorded process, so a process this server may not signal but can see holds.
+  const recorded = typeof event.payload?.processStartedAt === "string" ? new Date(event.payload.processStartedAt) : null;
+  const startedAt = recorded && !Number.isNaN(recorded.getTime()) ? recorded : null;
+  if (!await recordedProcessIsGone(pid, startedAt) || !await recordedProcessIsGone(-pid, startedAt)) return null;
   return { processPid: pid, processGroupId: pid };
 }
