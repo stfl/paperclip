@@ -531,6 +531,33 @@ export async function readReferencedSourceGitIgnoredPaths(
 // no scheme separator (a `://` form parses as a URL and never reaches this).
 const SCP_LIKE_REMOTE_PATTERN = /^[^@:/\s]+@[^@:/\s]+:\S+$/;
 
+// A bare repository of the host's shared mirrors, `file:///var/lib/agents-git/<name>.git`.
+// The URL names a path on the host and carries no credential surface. The host
+// may name the URL an execution host reaches the mirror by instead, in
+// PAPERCLIP_SANDBOX_MIRROR_ORIGINS, a JSON object from such a `file:` URL to
+// the URL to seed with, since a sandbox's git may read no configuration that
+// could map it (the GitHub launcher points GIT_CONFIG_GLOBAL and
+// GIT_CONFIG_SYSTEM at /dev/null).
+const HOST_MIRROR_PATH_PATTERN = /^\/var\/lib\/agents-git\/[A-Za-z0-9._-]+\.git$/;
+
+function isHostMirrorUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url.trim());
+    return parsed.protocol === "file:" && parsed.host === "" && HOST_MIRROR_PATH_PATTERN.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function hostMirrorOrigin(url: string): string {
+  try {
+    const mapped: unknown = JSON.parse(process.env.PAPERCLIP_SANDBOX_MIRROR_ORIGINS ?? "{}")?.[url];
+    return typeof mapped === "string" && mapped ? mapped : url;
+  } catch {
+    return url;
+  }
+}
+
 /**
  * Reduce a git remote URL to a credential-free form before it is copied into a
  * transported workspace, or null when the URL must not be carried at all.
@@ -555,6 +582,9 @@ export function sanitizeGitRemoteUrl(url: string): string | null {
       parsed.search = "";
       parsed.hash = "";
       return parsed.toString();
+    }
+    if (parsed.protocol === "file:") {
+      return isHostMirrorUrl(trimmed) ? hostMirrorOrigin(`file://${parsed.pathname}`) : null;
     }
     if (parsed.protocol === "ssh:" || parsed.protocol === "git:" || parsed.protocol === "git+ssh:") {
       // The username (conventionally `git`) is addressing, not a secret; a
@@ -597,6 +627,31 @@ export async function copyCloneTree(source: string, target: string): Promise<voi
   }
 }
 
+/**
+ * A repository whose origin is one of the host's mirrors chooses the identity
+ * its commits take in its own configuration. A sandbox's git reads no other
+ * configuration (see above), so the seeded clone gets those two keys when the
+ * repository sets them, and nothing else of its configuration.
+ */
+async function copyHostMirrorIdentity(localDir: string, cloneDir: string): Promise<void> {
+  const origin = await runLocalGit(localDir, ["config", "--local", "--get", "remote.origin.url"], {
+    timeout: 10_000,
+    maxBuffer: 16 * 1024,
+  }).then((result) => result.stdout.trim(), () => "");
+  if (!isHostMirrorUrl(origin)) return;
+  for (const key of ["user.name", "user.email"]) {
+    const value = await runLocalGit(localDir, ["config", "--local", "--get", key], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    }).then((result) => result.stdout.replace(/\n$/, ""), () => "");
+    if (!value) continue;
+    await runLocalGit(cloneDir, ["config", "--local", key, value], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    }).catch(() => undefined);
+  }
+}
+
 export async function withShallowGitWorkspaceClone<T>(
   input: {
     localDir: string;
@@ -628,6 +683,7 @@ export async function withShallowGitWorkspaceClone<T>(
         timeout: 10_000,
         maxBuffer: 16 * 1024,
       }).catch(() => undefined);
+      await copyHostMirrorIdentity(input.localDir, cloneDir);
     }
     await runLocalGit(cloneDir, ["fetch", "--depth=1", input.localDir, tempRef], {
       timeout: 60_000,
