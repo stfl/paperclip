@@ -392,3 +392,53 @@ fn pi_ordinary_request_timeout_still_retires_the_sidecar() {
         .shutdown()
         .expect("timeout cleanup remains idempotent");
 }
+
+#[test]
+fn managed_github_broker_environment_reaches_the_sidecar_only_with_the_launcher() {
+    const CHILD: &str = "PAPERCLIP_TEST_GITHUB_ENV_CHILD";
+    let Ok(run) = std::env::var(CHILD) else {
+        for run in ["managed", "ambient"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "managed_github_broker_environment_reaches_the_sidecar_only_with_the_launcher",
+                    "--nocapture",
+                ])
+                .env(CHILD, run)
+                .env("PAPERCLIP_GITHUB_BROKER_TOKEN", "fixture-broker-capability");
+            if run == "managed" {
+                child.env("PAPERCLIP_GITHUB_LAUNCHER_DIR", "/run/github/launcher");
+            }
+            let status = child.status().unwrap();
+            assert!(status.success(), "isolated {run} GitHub environment test failed");
+        }
+        return;
+    };
+    for agent in ["claude", "codex"] {
+        let mut sidecar = AcpxSidecarTransport::start_for_agent(
+            &AcpxSidecarTransportConfig {
+                command: PathBuf::from(env!("CARGO_BIN_EXE_fake-acpx-sidecar")),
+                args: vec!["--mode".into(), "mcp-environment".into()],
+                verified_launch: None,
+                request_timeout: Duration::from_secs(2),
+                shutdown_grace: Duration::from_millis(50),
+            },
+            agent,
+        )
+        .unwrap();
+        let response = sidecar
+            .request(GeneratedAcpxSidecarCommand::Initialize, json!({}))
+            .unwrap();
+        let expected = if run == "managed" {
+            json!("fixture-broker-capability")
+        } else {
+            serde_json::Value::Null
+        };
+        assert_eq!(
+            response["githubBrokerToken"], expected,
+            "{agent} sidecar, {run} run"
+        );
+        sidecar.shutdown().unwrap();
+    }
+}
