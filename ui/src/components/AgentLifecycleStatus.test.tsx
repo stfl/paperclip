@@ -47,3 +47,24 @@ it("retries a failed step once while pending and removes the failure after recov
     expect(container.textContent).toBe("");
   } finally { await act(async () => root.unmount()); }
 });
+
+it("shows a long wait as progress, not as a failure, and offers an immediate check", async () => {
+  const container = document.createElement("div");
+  const root = createRoot(container);
+  const retry = vi.fn();
+  const lifecycleWait = "Stopping agent execution is still waiting: a run is still executing (run_active). Paperclip keeps retrying.";
+  try {
+    await act(async () => root.render(<AgentLifecycleStatus agent={{ lifecycleState: "pausing", lifecycleError: null, lifecycleWait }} onRetry={retry} retryPending={false} />));
+    expect(container.textContent).toContain("Pausing agent");
+    expect(container.textContent).toContain(lifecycleWait);
+    expect(container.textContent).not.toContain("Agent pause failed");
+    expect(container.querySelector(".text-destructive")).toBeNull();
+    expect(container.querySelector('[aria-hidden="true"]')).not.toBeNull();
+    await act(async () => container.querySelector("button")!.click());
+    expect(retry).toHaveBeenCalledOnce();
+    // A failed step takes precedence over an earlier wait.
+    await act(async () => root.render(<AgentLifecycleStatus agent={{ lifecycleState: "pausing", lifecycleError: "The lifecycle step failed.", lifecycleWait }} onRetry={retry} retryPending={false} />));
+    expect(container.textContent).toContain("Agent pause failed");
+    expect(container.textContent).not.toContain(lifecycleWait);
+  } finally { await act(async () => root.unmount()); }
+});

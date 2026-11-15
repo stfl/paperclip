@@ -12,6 +12,11 @@ export interface LifecycleAgent {
   lifecycleOperation: AgentLifecycleOperation | null;
 }
 
+/** What a deferred attempt leaves on the agent. A string is the message of a
+ * failed step. A long wait is not a failure: it is kept apart, so the agent
+ * shows no error while the step is still retried. */
+export type LifecycleDeferralReport = string | { wait: string } | null;
+
 export interface LifecycleStore {
   get(id: string): Promise<LifecycleAgent | null>;
   change(id: string, command: LifecycleCommand, options?: { version?: number; owner?: string; reason?: string }): Promise<LifecycleAgent | null>;
@@ -20,13 +25,17 @@ export interface LifecycleStore {
   setRequiredPlugins(agent: LifecycleAgent, owner: string, pluginIds: string[]): Promise<boolean>;
   completeHost(agent: LifecycleAgent, owner: string): Promise<boolean>;
   completePlugin(agent: LifecycleAgent, owner: string, pluginId: string): Promise<boolean>;
-  defer(agent: LifecycleAgent, owner: string, error: string | null, now: Date): Promise<boolean>;
+  defer(agent: LifecycleAgent, owner: string, report: LifecycleDeferralReport, now: Date): Promise<boolean>;
   pending(limit: number, now: Date): Promise<string[]>;
 }
 
+/** A host step that waits on something it can name reports that key, so a long
+ * wait becomes visible on the agent. A wait with no key stays silent. */
+export type LifecycleHostResult = "complete" | "pending" | { pending: string };
+
 export interface LifecycleDriver {
   requiredPluginIds(agent: LifecycleAgent): Promise<string[]>;
-  runHost(agent: LifecycleAgent): Promise<"complete" | "pending">;
+  runHost(agent: LifecycleAgent): Promise<LifecycleHostResult>;
   runPlugin(agent: LifecycleAgent, pluginId: string): Promise<"complete" | "pending">;
   /** Notify the scheduler only after readiness has committed. */
   onReady?(agent: LifecycleAgent): Promise<void>;
