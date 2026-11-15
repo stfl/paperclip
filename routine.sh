@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
-# The deterministic steps of the stfl/paperclip carry routine. ROUTINE.md says
-# when to run each subcommand; `routine.sh help` lists them.
+# The deterministic steps of the stfl/paperclip carry routine. scripts/carry.sh
+# in stfl/paperclip-ci runs them in order; ROUTINE.md is the port agent's
+# brief. `routine.sh help` lists them.
 # Backticks in single quotes are Markdown for GitHub comments:
 # shellcheck disable=SC2016
 set -euo pipefail
 
 readonly FORK=stfl/paperclip
 readonly UPSTREAM_SLUG=paperclipai/paperclip
-readonly FORK_URL=https://github.com/$FORK
-readonly UPSTREAM_URL=https://github.com/$UPSTREAM_SLUG
-# A push URL no transport accepts, so nothing can push to upstream.
-readonly NO_PUSH=no-push://paperclipai-paperclip-is-read-only
-readonly CI_REPO=stfl/paperclip-ci
 readonly EXIT_CONFLICT=3
 readonly EXIT_STOP=4
 readonly EXIT_TESTS=5
@@ -48,14 +44,14 @@ usage: routine.sh [--dry-run] <command> [args]
   port-fail <branch> <why>  label needs-rebase, comment why, block push-next
   port-report <branch> <old-base> <old-tip> [<new-base> <new-tip>]
   push-next                 push the built stfl-next
-  dispatch                  dispatch the build in stfl/paperclip-ci
   save-rerere               commit the rerere cache to stfl-meta and push it
   summary                   print what this run did
   cleanup                   remove the build worktree and the run state
 
---dry-run (or DRY_RUN=1) prints every push, issue write, dispatch and the
-reset of the main clone's master instead.
-Environment: UPSTREAM (remote, path or URL of paperclipai/paperclip),
+--dry-run (or DRY_RUN=1) prints every push, issue write and the reset of the
+main clone's master instead.
+Environment: UPSTREAM (remote, path or URL of paperclipai/paperclip; default
+the remote named upstream),
 CURRENT_NEXT (ref taken as the current stfl-next), NEXT_DIR, STATE_DIR.
 EOF
 }
@@ -173,17 +169,7 @@ upstream_source() {
 		printf 'upstream\n'
 		return
 	fi
-	local d url
-	for d in "$(dirname "$REPO_TOP")"/*/ "$(dirname "$META_DIR")"/*/; do
-		url=$(git -C "$d" remote get-url origin 2>/dev/null) || continue
-		case $url in
-		*"$UPSTREAM_SLUG" | *"$UPSTREAM_SLUG.git" | *"$UPSTREAM_SLUG/")
-			printf '%s\n' "${d%/}"
-			return
-			;;
-		esac
-	done
-	die "no clone of $UPSTREAM_SLUG found next to $REPO_TOP: set UPSTREAM to its path or URL"
+	die "the clone has no remote named upstream: add one for $UPSTREAM_SLUG, or set UPSTREAM to its remote, path or URL"
 }
 
 # A branch's tip: its ported commit when this run ported it, else origin's.
@@ -241,58 +227,6 @@ push_ref() {
 
 # ---------------------------------------------------------------- setup
 
-is_repo_url() { # <url> <owner/name>
-	case $1 in
-	*[/:]"$2" | *[/:]"$2.git" | *[/:]"$2/") return 0 ;;
-	esac
-	return 1
-}
-
-has_remote() { G remote get-url "$1" >/dev/null 2>&1; }
-
-# A clone of upstream (the cloud attaches both repositories under one name)
-# gets origin = the fork and upstream = paperclipai/paperclip, push disabled.
-fix_remotes() {
-	local url
-	url=$(G remote get-url origin 2>/dev/null || true)
-	is_repo_url "$url" "$FORK" && return 0
-	log "origin is '$url', not $FORK: making it upstream, origin $FORK_URL"
-	if [[ -n $url ]] && ! has_remote upstream; then
-		G remote rename origin upstream
-	else
-		has_remote upstream || G remote add upstream "$UPSTREAM_URL"
-		if [[ -n $url ]]; then G remote remove origin; fi
-	fi
-	G remote set-url upstream "$UPSTREAM_URL"
-	G remote set-url --push upstream "$NO_PUSH"
-	G remote add origin "$FORK_URL"
-}
-
-# Ancestry checks need the whole history: deepen from the remote whose refs
-# hold the shallow boundary, then fetch the other.
-unshallow() {
-	[[ $(G rev-parse --is-shallow-repository) == true ]] || return 0
-	local boundary r from=''
-	boundary=$(head -n1 "$GIT_COMMON/shallow")
-	for r in upstream origin; do
-		has_remote "$r" || continue
-		if [[ -n $(G for-each-ref --count=1 --contains "$boundary" "refs/remotes/$r/") ]]; then
-			from=$r
-			break
-		fi
-	done
-	if [[ -z $from ]]; then
-		from=origin
-		if has_remote upstream; then from=upstream; fi
-	fi
-	log "shallow clone: fetching the full history from $from"
-	G fetch --quiet --unshallow --no-tags "$from"
-	for r in upstream origin; do
-		if [[ $r == "$from" ]] || ! has_remote "$r"; then continue; fi
-		G fetch --quiet --no-tags "$r" "+refs/heads/master:refs/remotes/$r/master"
-	done
-}
-
 # The main clone's master at origin/master, so nothing reads upstream's
 # commits as unpushed work of this clone.
 reset_local_master() {
@@ -322,8 +256,6 @@ cmd_setup() {
 		G config user.name >/dev/null || G config user.name "$BOT_NAME"
 	fi
 
-	fix_remotes
-	unshallow
 	up=$(upstream_source)
 	log "fetching origin and upstream ($up)"
 	G fetch --quiet --no-tags origin \
@@ -697,16 +629,6 @@ cmd_push_next() {
 	record "stfl-next: pushed $sha (was ${lease:-absent})$(dry && printf ' (dry run)')"
 }
 
-cmd_dispatch() {
-	need_state
-	if act gh api -X POST "repos/$CI_REPO/actions/workflows/build.yml/dispatches" \
-		-f ref=main -f 'inputs[dotfiles_ref]=main' --silent; then
-		record "dispatch: $CI_REPO build.yml dispatched$(dry && printf ' (dry run)')"
-	else
-		record "dispatch: REFUSED; $CI_REPO's daily schedule at 06:30 UTC builds stfl-next anyway"
-	fi
-}
-
 cmd_save_rerere() {
 	need_state
 	local src=$GIT_COMMON/rr-cache dst=$META_DIR/rr-cache
@@ -789,7 +711,7 @@ main() {
 	}
 	local cmd=$1
 	shift
-	dry && log "(dry run: pushes, issue writes and the dispatch are printed, not done)"
+	dry && log "(dry run: pushes and issue writes are printed, not done)"
 	case $cmd in
 	setup) cmd_setup ;;
 	plan) cmd_plan ;;
@@ -801,7 +723,6 @@ main() {
 	port-fail) cmd_port_fail "$@" ;;
 	port-report) cmd_port_report "$@" ;;
 	push-next) cmd_push_next ;;
-	dispatch) cmd_dispatch ;;
 	save-rerere) cmd_save_rerere ;;
 	summary) cat "$STATE_DIR/summary" ;;
 	cleanup) cmd_cleanup ;;
