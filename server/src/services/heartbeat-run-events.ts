@@ -26,7 +26,18 @@ export interface AppendHeartbeatRunEventInput {
     protocolSchemaVersion: number;
     canonicalPayload: Record<string, unknown>;
   };
+  /**
+   * Run columns to change in the same UPDATE that reserves the sequence. A
+   * second UPDATE of a run row this transaction already changed makes
+   * PostgreSQL re-check every foreign key on heartbeat_runs (KEY SHARE on the
+   * agent, issue, predecessor run, ...), so it can wait behind, or deadlock
+   * with, an unrelated transaction that holds one of those rows FOR UPDATE.
+   */
+  runUpdate?: HeartbeatRunEventRunUpdate;
 }
+
+export type HeartbeatRunEventRunUpdate = Partial<Pick<typeof heartbeatRuns.$inferInsert,
+  "processPid" | "processGroupId" | "processStartedAt">>;
 
 export interface AppendHeartbeatRunEventResult {
   row: typeof heartbeatRunEvents.$inferSelect;
@@ -51,10 +62,12 @@ export class HeartbeatRunEventConflictError extends Error {
 export async function allocateHeartbeatRunEventSeq(
   db: Db,
   runId: string,
+  runUpdate: HeartbeatRunEventRunUpdate = {},
 ): Promise<number> {
   const [updated] = await db
     .update(heartbeatRuns)
     .set({
+      ...runUpdate,
       nextEventSeq: sql`${heartbeatRuns.nextEventSeq} + 1`,
       updatedAt: new Date(),
     })
@@ -68,7 +81,9 @@ export async function appendHeartbeatRunEvent(
   db: Db,
   input: AppendHeartbeatRunEventInput,
 ): Promise<AppendHeartbeatRunEventResult> {
-  if (!input.nativeSource && !input.retryExhaustion) {
+  // Deduplicated receipts return without allocating, so they cannot carry run changes.
+  if (input.runUpdate && (input.nativeSource || input.retryExhaustion)) throw new Error("heartbeat_run_event_run_update_unsupported");
+  if (!input.runUpdate && !input.nativeSource && !input.retryExhaustion) {
     const allocated = db.$with("allocated_run_event", {}).as(sql`
       update ${heartbeatRuns}
       set next_event_seq = ${heartbeatRuns.nextEventSeq} + 1,
@@ -177,6 +192,7 @@ export async function appendHeartbeatRunEvent(
     const seq = await allocateHeartbeatRunEventSeq(
       tx as unknown as Db,
       input.runId,
+      input.runUpdate,
     );
     const [row] = await tx.insert(heartbeatRunEvents).values({
       companyId: input.companyId,
