@@ -1096,7 +1096,20 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
                 eq(nativeRunFinalizations.issueId, run.nativeIssueId), eq(nativeRunFinalizations.phase, "committed"),
               )).limit(1)
             : [];
-          if (!finalized) return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          if (!finalized) {
+            // An uncommitted native run still owes its own agent a
+            // reconciliation, so that agent's saved work waits. A task that has
+            // since passed to another agent owes that agent a first turn: its
+            // saved wakes are a fresh assignment, not a continuation of this
+            // run. The execution blocker below still holds them until this
+            // run's files are saved.
+            const [task] = contextIssueId && run.nativeIssueId === contextIssueId
+              ? await tx.select({ assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId })
+                  .from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, contextIssueId))).limit(1)
+              : [];
+            if (!task?.assigneeAgentId || task.assigneeUserId || task.assigneeAgentId === run.agentId)
+              return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          }
         }
         if (input.resumeStrandedQueue && await hasPendingRunCleanup(tx, input.companyId, run.id)) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
