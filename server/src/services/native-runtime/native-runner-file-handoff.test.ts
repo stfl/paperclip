@@ -1378,4 +1378,50 @@ describe("native runner file handoff", () => {
       await db.update(heartbeatRuns).set({ resultJson: run.resultJson }).where(eq(heartbeatRuns.id, runId));
     }
   });
+
+  it("refuses a wake attachment to a run of an agent that is not the task's assignee, whatever its admission record says", async () => {
+    const storage = createStorageService(createLocalDiskStorageProvider(storageRoot));
+    const { attachment, comment } = await createInboundAttachmentFixture({
+      storage,
+      filename: "handed-over.txt",
+      body: Buffer.from("bytes of a task that belongs to someone else\n", "utf8"),
+      commentBody: "Please inspect the attached file.",
+    });
+    const formerAssigneeId = randomUUID();
+    const formerAssigneeRunId = randomUUID();
+    const root = await mkdtemp(path.join(temporaryRoot, "not-the-assignee-"));
+    await db.insert(agents).values({
+      id: formerAssigneeId, companyId, name: "Former assignee", adapterType: "paperclip_runner",
+      adapterConfig: { provider: "codex" }, runtimeConfig: {}, status: "active",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: formerAssigneeRunId, companyId, agentId: formerAssigneeId, status: "running", runtimeMode: "native",
+      nativeIssueId: issueId, invocationSource: "automation", triggerDetail: "system",
+      // The queue records this when it admits a comment wake for an agent that is not the assignee.
+      runnerProfileJson: { aiConnectionNonAssigneeCommentWake: true },
+      contextSnapshot: {
+        issueId, wakeReason: "issue_commented", wakeCommentId: comment.id,
+        paperclipWake: { comments: [{ id: comment.id, body: "Please inspect the attached file.", attachments: [{
+          id: attachment.id, filename: "handed-over.txt", contentType: "text/plain",
+          byteSize: attachment.byteSize, contentPath: `/api/attachments/${attachment.id}/content`,
+        }] }] },
+      },
+    });
+    const stage = () => stageNativeRunnerWakeAttachments({
+      db, storage,
+      binding: { companyId, issueId, runId: formerAssigneeRunId, agentId: formerAssigneeId, workspaceRoot: root, executionTargetKind: "local" },
+    });
+    try {
+      await expect(stage()).rejects.toThrow("paperclip_runner_attachment_staging_not_authorized");
+      // Holding the task's execution does not replace being its assignee or reviewer.
+      await db.update(issues).set({ executionRunId: formerAssigneeRunId }).where(eq(issues.id, issueId));
+      await expect(stage()).rejects.toThrow("paperclip_runner_attachment_staging_not_authorized");
+      await expect(readdir(root)).resolves.toEqual([]);
+    } finally {
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, formerAssigneeRunId));
+      await db.delete(agents).where(eq(agents.id, formerAssigneeId));
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
