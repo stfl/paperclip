@@ -45,6 +45,27 @@ export async function recordLegacyCaseHandoffCleanupIntent(db: Db, input: {
   });
 }
 
+/**
+ * Commits the spawned process identity and its cleanup intent together. The
+ * second run event re-checks the run row's foreign keys, which takes KEY SHARE
+ * on the issue while this transaction holds the run row. A Stop for a
+ * reassignment takes the issue and then the run row, so the issue is locked
+ * here first: the two then wait for each other in one order.
+ */
+export async function recordProcessIdentityWithLegacyCleanupIntent<T>(
+  db: Db,
+  input: Parameters<typeof recordLegacyCaseHandoffCleanupIntent>[1],
+  persistIdentity: (tx: Db) => Promise<T>,
+): Promise<T> {
+  return db.transaction(async transaction => {
+    const tx = transaction as unknown as Db;
+    await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, input.issueId)).for("key share");
+    const persisted = await persistIdentity(tx);
+    await recordLegacyCaseHandoffCleanupIntent(tx, input);
+    return persisted;
+  });
+}
+
 /** Called by scratch cleanup before irreversible removal, never by an adapter. */
 export async function recordLegacyCaseHandoffCleanupVerified(db: Db, input: {
   runId: string; controllerBootId: string; scratch: HeartbeatRunScratch;
