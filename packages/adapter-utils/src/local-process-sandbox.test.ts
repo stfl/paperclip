@@ -308,6 +308,30 @@ describe("local process sandbox", () => {
     ).rejects.toThrow("requires Bubblewrap");
   });
 
+  it("refuses a sandbox command other than the one the host names", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-sandbox-host-command-"));
+    cleanup.push(workspace);
+    process.env.PAPERCLIP_SANDBOX_BWRAP = path.join(workspace, "host-bwrap");
+    try {
+      await expect(
+        runChildProcess("filesystem-sandbox-host-command", process.execPath, ["-e", "process.exit(0)"], {
+          cwd: workspace,
+          env: {},
+          timeoutSec: 10,
+          graceSec: 1,
+          onLog: async () => {},
+          localProcessSandbox: {
+            workspaceDir: workspace,
+            filesystemScope: "workspace",
+            command: path.join(workspace, "agent-chosen-bwrap"),
+          },
+        }),
+      ).rejects.toThrow("is not the host bubblewrap");
+    } finally {
+      delete process.env.PAPERCLIP_SANDBOX_BWRAP;
+    }
+  });
+
   it.runIf(Boolean(process.env.PAPERCLIP_TEST_BWRAP))(
     "prevents reads outside the workspace while allowing workspace writes",
     async () => {
