@@ -2485,6 +2485,8 @@ async function listPendingFinalizeBlockerIssueIds(
       phase: workspaceOperations.phase,
       status: workspaceOperations.status,
       startedAt: workspaceOperations.startedAt,
+      finishedAt: workspaceOperations.finishedAt,
+      heartbeatRunId: workspaceOperations.heartbeatRunId,
     })
     .from(workspaceOperations)
     .where(
@@ -2497,10 +2499,14 @@ async function listPendingFinalizeBlockerIssueIds(
       ),
     );
 
-  const latestAttributedByBlockerWorkspace = new Map<
-    string,
-    { phase: string; status: string; startedAt: Date }
-  >();
+  type BlockerOperation = {
+    phase: string;
+    status: string;
+    startedAt: Date;
+    finishedAt: Date | null;
+    heartbeatRunId: string | null;
+  };
+  const latestAttributedByBlockerWorkspace = new Map<string, BlockerOperation>();
   const latestUnattributedByWorkspace = new Map<
     string,
     { phase: string; status: string; startedAt: Date }
@@ -2528,6 +2534,8 @@ async function listPendingFinalizeBlockerIssueIds(
           phase: row.phase,
           status: row.status,
           startedAt: row.startedAt,
+          finishedAt: row.finishedAt,
+          heartbeatRunId: row.heartbeatRunId,
         });
       }
       continue;
@@ -2543,11 +2551,19 @@ async function listPendingFinalizeBlockerIssueIds(
     }
   }
 
+  // The blocker's own latest operation, for the pairs no workspace finalize settles.
+  const unsettled: Array<{
+    blockerIssueId: string;
+    executionWorkspaceId: string;
+    own: BlockerOperation | null;
+  }> = [];
   for (const pair of blockerWorkspacePairs) {
-    const latest =
+    const own =
       latestAttributedByBlockerWorkspace.get(
         `${pair.blockerIssueId}:${pair.executionWorkspaceId}`,
-      ) ?? latestUnattributedByWorkspace.get(pair.executionWorkspaceId);
+      ) ?? null;
+    const latest =
+      own ?? latestUnattributedByWorkspace.get(pair.executionWorkspaceId);
     if (!latest) continue; // no ops recorded -> nothing to finalize for this blocker
     if (latest.phase === "workspace_finalize" && latest.status === "succeeded")
       continue;
@@ -2556,7 +2572,58 @@ async function listPendingFinalizeBlockerIssueIds(
     );
     if (laterSuccessfulFinalize && laterSuccessfulFinalize > latest.startedAt)
       continue;
-    pending.add(pair.blockerIssueId);
+    unsettled.push({ ...pair, own });
+  }
+
+  // Saved-work recovery ends with its own successful finalize for the run it
+  // recovered, recorded without a workspace. It settles the blocker's finished
+  // operation of that run. It is never a workspace-wide save: another issue on
+  // a shared workspace keeps its own barrier.
+  const recoverable = unsettled.filter(
+    ({ own }) =>
+      own !== null &&
+      own.heartbeatRunId !== null &&
+      ["succeeded", "failed", "skipped"].includes(own.status),
+  );
+  const recoveryFinalizes =
+    recoverable.length === 0
+      ? []
+      : await dbOrTx
+          .select({
+            issueId: workspaceOperations.issueId,
+            heartbeatRunId: workspaceOperations.heartbeatRunId,
+            executionWorkspaceId: workspaceOperations.executionWorkspaceId,
+            startedAt: workspaceOperations.startedAt,
+          })
+          .from(workspaceOperations)
+          .where(
+            and(
+              eq(workspaceOperations.companyId, companyId),
+              inArray(workspaceOperations.issueId, [
+                ...new Set(recoverable.map((pair) => pair.blockerIssueId)),
+              ]),
+              inArray(workspaceOperations.heartbeatRunId, [
+                ...new Set(recoverable.map((pair) => pair.own!.heartbeatRunId!)),
+              ]),
+              eq(workspaceOperations.phase, "workspace_finalize"),
+              eq(workspaceOperations.status, "succeeded"),
+              sql`${workspaceOperations.metadata}->>'owningService' = 'workspace_recovery'`,
+            ),
+          );
+
+  for (const pair of unsettled) {
+    const own = recoverable.includes(pair) ? pair.own : null;
+    const settledByRecovery =
+      own !== null &&
+      recoveryFinalizes.some(
+        (finalize) =>
+          finalize.issueId === pair.blockerIssueId &&
+          finalize.heartbeatRunId === own.heartbeatRunId &&
+          (finalize.executionWorkspaceId === null ||
+            finalize.executionWorkspaceId === pair.executionWorkspaceId) &&
+          finalize.startedAt >= (own.finishedAt ?? own.startedAt),
+      );
+    if (!settledByRecovery) pending.add(pair.blockerIssueId);
   }
 
   return pending;
