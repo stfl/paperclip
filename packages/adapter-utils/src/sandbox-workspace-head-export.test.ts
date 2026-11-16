@@ -1,5 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -10,6 +11,7 @@ import {
   type SandboxManagedRuntimeClient,
   type SandboxSyncOperation,
   type SandboxSyncResult,
+  WORKSPACE_GIT_BUNDLE_TOO_LARGE,
 } from "./sandbox-managed-runtime.js";
 
 const execFile = promisify(execFileCallback);
@@ -87,13 +89,37 @@ function filesystemClient(native: boolean): SandboxManagedRuntimeClient {
   return client;
 }
 
+// A target that rewrites every bundle it produces to also carry
+// `refs/tags/injected`, pointing into the exported history.
+function taggingClient(remote: string): SandboxManagedRuntimeClient {
+  const client = filesystemClient(true);
+  const run = client.run;
+  client.run = async (command, options) => {
+    await run(command, options);
+    const runtimeDir = path.join(remote, ".paperclip-runtime", "test");
+    for (const name of await readdir(runtimeDir).catch(() => [])) {
+      const bundle = path.join(runtimeDir, name);
+      if (!name.endsWith(".bundle") || (await readFile(bundle)).byteLength === 0) continue;
+      const [sha, ref] = (await git(remote, ["bundle", "list-heads", bundle])).split(" ");
+      await git(remote, ["update-ref", ref!, sha!]);
+      await git(remote, ["tag", "-f", "injected", sha!]);
+      await git(remote, ["bundle", "create", `${bundle}.tagged`, ref!, "refs/tags/injected"]);
+      await git(remote, ["update-ref", "-d", ref!]);
+      await git(remote, ["tag", "-d", "injected"]);
+      await writeFile(bundle, await readFile(`${bundle}.tagged`));
+      await rm(`${bundle}.tagged`);
+    }
+  };
+  return client;
+}
+
 describe("sandbox workspace HEAD export", () => {
   const cleanupDirs: string[] = [];
   afterEach(async () => {
     for (const dir of cleanupDirs.splice(0)) await rm(dir, { recursive: true, force: true });
   });
 
-  async function setup(native = true) {
+  async function setup(native = true, makeClient?: (remote: string) => SandboxManagedRuntimeClient) {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-head-export-"));
     cleanupDirs.push(root);
     const host = path.join(root, "host");
@@ -107,7 +133,7 @@ describe("sandbox workspace HEAD export", () => {
     const prepared = await prepareSandboxManagedRuntime({
       spec: { transport: "sandbox", provider: "test", sandboxId: "head-export", remoteCwd: remote, timeoutMs: 30_000, apiKey: null },
       adapterKey: "test",
-      client: filesystemClient(native),
+      client: makeClient ? makeClient(remote) : filesystemClient(native),
       workspaceLocalDir: host,
     });
     return { host, remote, base, prepared };
@@ -184,6 +210,56 @@ describe("sandbox workspace HEAD export", () => {
     }
     expect(restored[1]).toEqual(restored[0]);
     expect(restored[0]!.log.split("\n").map((line) => line.split(" ")[1])).toEqual(["second", "first", "base"]);
+  });
+
+  it("imports no tag and writes no FETCH_HEAD from a bundle the target added a tag to, at export and final restore", async () => {
+    const { host, remote, prepared } = await setup(true, taggingClient);
+    const gitDir = await git(host, ["rev-parse", "--absolute-git-dir"]);
+    await commitInRemote(remote, "app.txt", "first\n", "first");
+
+    await prepared.exportWorkspaceGitHead({ localRef: EXPORT_REF });
+    expect(await git(host, ["tag", "--list"])).toBe("");
+    await expect(stat(path.join(gitDir, "FETCH_HEAD"))).rejects.toMatchObject({ code: "ENOENT" });
+
+    const head = await commitInRemote(remote, "app.txt", "second\n", "second");
+    await prepared.restoreWorkspace();
+    expect(await git(host, ["rev-parse", "HEAD"])).toBe(head);
+    expect(await git(host, ["tag", "--list"])).toBe("");
+    await expect(stat(path.join(gitDir, "FETCH_HEAD"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([true, false])("refuses a bundle over the size limit and keeps the previous ref (native sync out: %s)", async (native) => {
+    const { host, remote, prepared } = await setup(native);
+    const first = await commitInRemote(remote, "app.txt", "first\n", "first");
+    await prepared.exportWorkspaceGitHead({ localRef: EXPORT_REF });
+    await commitInRemote(remote, "big.txt", randomBytes(64 * 1024).toString("hex"), "big");
+
+    await expect(prepared.exportWorkspaceGitHead({ localRef: EXPORT_REF, maxBundleBytes: 32 * 1024 }))
+      .rejects.toThrow(WORKSPACE_GIT_BUNDLE_TOO_LARGE);
+    expect(await git(host, ["rev-parse", EXPORT_REF])).toBe(first);
+  });
+
+  it("keeps the previous ref when the bundle names another commit than the target reported", async () => {
+    let tamper = false;
+    const { host, remote, base, prepared } = await setup(true, () => {
+      const client = filesystemClient(true);
+      const readRemote = client.readFile;
+      client.readFile = async (remotePath, options) => {
+        const bytes = await readRemote(remotePath, options);
+        if (!tamper || !remotePath.endsWith(".txt")) return bytes;
+        const [, ...rest] = Buffer.from(bytes as Buffer).toString("utf8").split("\n");
+        return Buffer.from([base, ...rest].join("\n"));
+      };
+      return client;
+    });
+    const first = await commitInRemote(remote, "app.txt", "first\n", "first");
+    await prepared.exportWorkspaceGitHead({ localRef: EXPORT_REF });
+    await commitInRemote(remote, "app.txt", "second\n", "second");
+    tamper = true;
+
+    await expect(prepared.exportWorkspaceGitHead({ localRef: EXPORT_REF })).rejects.toThrow("workspace_git_head_import_mismatch");
+    expect(await git(host, ["rev-parse", EXPORT_REF])).toBe(first);
+    expect(await git(host, ["for-each-ref", "--format=%(refname)", "refs/paperclip/git-sync/"])).toBe("");
   });
 
   it("refuses a workspace without git", async () => {

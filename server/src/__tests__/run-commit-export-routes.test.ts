@@ -67,6 +67,11 @@ describe("POST /heartbeat-runs/:runId/workspace/export-commits", () => {
   it.each([
     ["another agent of the company", { ...runAgent, agentId: otherAgentId }, "not_run_agent"],
     ["a board viewer", { ...boardMember, memberships: [{ companyId: "company-1", status: "active", membershipRole: "viewer" }] }, "no_company_access"],
+    ["the run's agent acting for a user without membership", { ...runAgent, onBehalfOfUserId: "user-2", onBehalfOfMemberships: [] }, "no_company_access"],
+    ["the run's agent acting for a viewer", {
+      ...runAgent, onBehalfOfUserId: "user-2",
+      onBehalfOfMemberships: [{ companyId: "company-1", status: "active", membershipRole: "viewer" }],
+    }, "no_company_access"],
   ])("refuses %s with 403", async (_label, actor, code) => {
     const res = await request(createApp(liveRun, actor)).post(path);
     expect(res.status).toBe(403);
@@ -74,9 +79,13 @@ describe("POST /heartbeat-runs/:runId/workspace/export-commits", () => {
     expect(exporter.exportCommits).not.toHaveBeenCalled();
   });
 
-  it("answers 404 for a run of another company", async () => {
-    const res = await request(createApp(liveRun, { ...runAgent, companyId: "company-2" })).post(path);
-    expect(res.status).toBe(404);
+  it("answers the same 404 for a missing run and a run of another company", async () => {
+    const foreign = await request(createApp(liveRun, { ...runAgent, companyId: "company-2" })).post(path);
+    const missing = await request(createApp(null, runAgent)).post(path);
+    for (const res of [foreign, missing]) {
+      expect(res.status).toBe(404);
+      expect(res.body).toEqual({ error: "Heartbeat run not found", code: "run_not_found" });
+    }
   });
 
   it("refuses a run that is not running with 409", async () => {
@@ -88,6 +97,8 @@ describe("POST /heartbeat-runs/:runId/workspace/export-commits", () => {
 
   it.each([
     [() => { throw new Error("workspace_git_unavailable"); }, 409, "no_git_workspace"],
+    [() => { throw new Error("workspace_git_bundle_too_large"); }, 413, "bundle_too_large"],
+    [() => { throw new Error("workspace_commit_export_closed"); }, 409, "workspace_not_exportable"],
     [() => { throw new Error("fatal: bundle create failed"); }, 502, "export_failed"],
   ])("maps an exporter failure to its status and reason", async (failure, status, code) => {
     vi.mocked(exporter.exportCommits).mockImplementationOnce(async () => failure());

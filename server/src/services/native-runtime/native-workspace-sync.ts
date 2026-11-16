@@ -4,6 +4,7 @@ import type { AdapterRuntimeEvent } from "@paperclipai/adapter-utils";
 import type { WorkspaceCheckpointMetrics } from "@paperclipai/adapter-utils/workspace-checkpoint";
 import type { RuntimeSpanRunner } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import fs from "node:fs/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -16,7 +17,7 @@ import {
   type AdapterExecutionTarget,
   type PreparedAdapterExecutionTargetRuntime,
 } from "@paperclipai/adapter-utils/execution-target";
-import { deleteLocalGitRef, disposeGitWorkspaceSnapshot, exportLocalGitHead, type GitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { deleteLocalGitRef, disposeGitWorkspaceSnapshot, type GitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import {
   directorySnapshotSha256,
   disposeDirectorySnapshot,
@@ -48,6 +49,8 @@ const GIT_SEED_NAME = "git-seed.tar";
 const REMOTE_STAMP_NAME = "workspace-sync-v1.json";
 const EXPORTED_REF_NAME = "exported-ref.json";
 const EXPORTED_REF_PREFIX = "refs/paperclip/runs/";
+const COMMIT_EXPORT_CLOSE_TIMEOUT_MS = 30_000;
+export const COMMIT_EXPORT_CLOSED = "workspace_commit_export_closed";
 const MAX_DESCRIPTOR_BYTES = 64 * 1024 * 1024;
 const SAFE_SEGMENT_RE = /^[A-Za-z0-9_-]+$/;
 
@@ -100,9 +103,10 @@ export interface PreparedNativeWorkspaceSync {
   restoreWorkspace(assertOwnership?: () => Promise<void>): Promise<void>;
   /**
    * Point `localRef` of the host repository at the run workspace's current
-   * `HEAD`. Calls are serialized. The ref is deleted once the final restore
-   * succeeds, by {@link cleanupNativeWorkspaceSync}, or by
-   * `releaseCommitExport` for a ref written after the final restore.
+   * `HEAD`. Calls are serialized. `restoreWorkspace`, `cleanup` and
+   * `releaseCommitExport` close the export first, and later calls fail with
+   * {@link COMMIT_EXPORT_CLOSED}. The ref is deleted once the final restore
+   * succeeds, at `cleanup`, or by {@link cleanupNativeWorkspaceSync}.
    */
   exportCommits(localRef: string): Promise<WorkspaceGitHeadExport>;
   releaseCommitExport(): Promise<void>;
@@ -910,6 +914,7 @@ export async function prepareNativeWorkspaceSync(input: {
   onPhase?: RuntimeSpanRunner;
   onCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
+  commitExportCloseTimeoutMs?: number;
 }): Promise<PreparedNativeWorkspaceSync | null> {
   if (input.target?.kind !== "remote" || input.target.transport !== "sandbox" || input.target.runnerTask) {
     return null;
@@ -1114,15 +1119,37 @@ export async function prepareNativeWorkspaceSync(input: {
     reason: reuseReason,
   });
   let restorePromise: Promise<void> | null = null;
-  let workspaceFinalized = false;
+  let exportsClosed = false;
   let exportQueue: Promise<unknown> = Promise.resolve();
-  let refExportedAfterFinalize: string | null = null;
+  let exportedRef: string | null = null;
+  let refRetired = false;
+  const deleteRunRef = async () => {
+    await deleteExportedRef(input.runId).catch(() => undefined);
+    if (exportedRef) await deleteLocalGitRef({ localDir: descriptor.binding.localCwd, ref: exportedRef });
+  };
+  const retireRef = async () => {
+    refRetired = true;
+    await deleteRunRef();
+  };
+  // Bounded so a hung export cannot hold finalization; an export that settles
+  // after the timeout deletes its ref again once the ref is retired.
+  const closeExports = async () => {
+    exportsClosed = true;
+    const timeout = new AbortController();
+    const settled = await Promise.race([
+      exportQueue.then(() => true),
+      sleep(input.commitExportCloseTimeoutMs ?? COMMIT_EXPORT_CLOSE_TIMEOUT_MS, false, { signal: timeout.signal }).catch(() => false),
+    ]);
+    timeout.abort();
+    if (!settled) void exportQueue.then(() => (refRetired ? deleteRunRef() : undefined));
+  };
   return {
     mode,
     get reference() {
       return reference;
     },
     restoreWorkspace: async (assertOwnership) => {
+      await closeExports();
       if (!restorePromise) {
         restorePromise = finalizePreparedRuntime({
           db: input.db,
@@ -1143,38 +1170,26 @@ export async function prepareNativeWorkspaceSync(input: {
           });
       }
       await restorePromise;
-      if (!workspaceFinalized) {
-        workspaceFinalized = true;
-        await deleteExportedRef(input.runId).catch(() => undefined);
-      }
+      await retireRef();
     },
     exportCommits: (localRef) => {
+      if (exportsClosed) return Promise.reject(new Error(COMMIT_EXPORT_CLOSED));
       const exported = exportQueue.then(async () => {
-        const localDir = descriptor.binding.localCwd;
-        // After the final restore the host branch holds the run's commits.
-        if (workspaceFinalized) {
-          refExportedAfterFinalize = localRef;
-          return exportLocalGitHead({ localDir, localRef });
-        }
         if (!preparedRuntime.exportWorkspaceGitHead) throw new Error("workspace_git_unavailable");
-        await recordExportedRef(input.runId, localDir, localRef);
-        const result = await preparedRuntime.exportWorkspaceGitHead({ localRef });
-        // The final restore does not wait for an export in flight; a ref
-        // written after it deleted the ref is removed on release.
-        if (workspaceFinalized) refExportedAfterFinalize = localRef;
-        return result;
+        exportedRef = localRef;
+        await recordExportedRef(input.runId, descriptor.binding.localCwd, localRef);
+        return preparedRuntime.exportWorkspaceGitHead({ localRef });
       });
       exportQueue = exported.catch(() => undefined);
       return exported;
     },
-    releaseCommitExport: async () => {
-      await exportQueue;
-      if (refExportedAfterFinalize) {
-        await deleteLocalGitRef({ localDir: descriptor.binding.localCwd, ref: refExportedAfterFinalize });
-        refExportedAfterFinalize = null;
-      }
+    releaseCommitExport: closeExports,
+    cleanup: async () => {
+      await closeExports();
+      await retireRef();
+      await preparedRuntime.cleanupWorkspaceSnapshot?.();
+      await cleanupNativeWorkspaceSync(input.runId);
     },
-    cleanup: async () => { await preparedRuntime.cleanupWorkspaceSnapshot?.(); await cleanupNativeWorkspaceSync(input.runId); },
   };
   } catch (error) {
     await runtime?.cleanupWorkspaceSnapshot?.();
@@ -1255,6 +1270,7 @@ export async function resumeNativeWorkspaceSync(input: {
       leaseId: existing.descriptor.binding.leaseId,
       stamp,
     });
+    await deleteExportedRef(input.runId).catch(() => undefined);
     return true;
   }
   const runtime = await prepareRuntime({
@@ -1278,6 +1294,7 @@ export async function resumeNativeWorkspaceSync(input: {
     onPhase: input.onPhase,
     onCheckpoint: input.onCheckpoint,
   });
+  await deleteExportedRef(input.runId).catch(() => undefined);
   return true;
 }
 

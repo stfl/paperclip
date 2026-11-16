@@ -701,7 +701,7 @@ export async function fetchGitBundleIntoLocalRef(input: {
     return input.baseSha;
   }
 
-  await runLocalGit(input.localDir, ["fetch", "--force", input.bundlePath, `${input.exportRef}:${input.importedRef}`], {
+  await runLocalGit(input.localDir, ["fetch", "--force", "--no-tags", "--no-write-fetch-head", input.bundlePath, `${input.exportRef}:${input.importedRef}`], {
     timeout: 60_000,
     maxBuffer: 1024 * 1024,
   });
@@ -849,8 +849,8 @@ export async function exportLocalGitHead(input: {
 /**
  * Bundle one pinned `HEAD` of a workspace that may still be committing.
  * `HEAD` is read once, so the bundle, the recorded commit and the bundle's
- * boundary all name the same commit. Writes `<sha>\n<branch or empty>` to
- * `headInfoPath`. An empty bundle means the host already holds the commit
+ * boundary all name the same commit. Writes `<sha>\n<branch or empty>\n<bundle
+ * bytes>` to `headInfoPath`. An empty bundle means the host already holds the commit
  * (`HEAD` is an ancestor of `baseSha`).
  */
 export function buildRemoteGitHeadExportScript(input: {
@@ -888,7 +888,7 @@ export function buildRemoteGitHeadExportScript(input: {
     "else",
     `  git -C ${dir} bundle create ${bundlePath} ${exportRef} >/dev/null`,
     "fi",
-    `{ printf '%s\\n' "$head"; git -C ${dir} symbolic-ref --quiet --short HEAD || true; } > ${shellQuote(input.headInfoPath)}`,
+    `{ printf '%s\\n' "$head"; git -C ${dir} symbolic-ref --quiet --short HEAD || echo; wc -c < ${bundlePath}; } > ${shellQuote(input.headInfoPath)}`,
   ].join("\n");
 }
 
