@@ -6,11 +6,13 @@ merge of every open carry branch of `stfl/paperclip`. Each open issue of
 upstream PR, the branch it is stacked on and its `REMOVE WHEN`. The design is
 ADR 0002 in Stefan's dotfiles (`docs/paperclip/adr/0002-paperclip-carry-fork.md`).
 
-`scripts/carry.sh` in `stfl/paperclip-ci` runs every step of the routine on
-kondor's self-hosted runner, except one: porting a branch whose merge into
-`stfl-next` conflicts. That step is yours. Your prompt gives the absolute
-paths of the clone, of `routine.sh` and of the build worktree; call
-`routine.sh` by its absolute path.
+The workflow `build.yml` of `stfl/paperclip-ci` runs the routine through
+`scripts/carry.sh`: its `carry` job on a GitHub-hosted runner, and, when a
+merge into `stfl-next` conflicts, its `port` job on kondor's self-hosted
+runner. The `port` job rebuilds `stfl-next` up to the conflict and gives you
+the one step that is yours: porting the conflicting branch. Your prompt gives
+the absolute paths of the clone, of `routine.sh` and of the build worktree;
+call `routine.sh` by its absolute path.
 
 ## Never
 
