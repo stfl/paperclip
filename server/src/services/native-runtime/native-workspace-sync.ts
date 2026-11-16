@@ -16,7 +16,7 @@ import {
   type AdapterExecutionTarget,
   type PreparedAdapterExecutionTargetRuntime,
 } from "@paperclipai/adapter-utils/execution-target";
-import { disposeGitWorkspaceSnapshot, type GitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { deleteLocalGitRef, disposeGitWorkspaceSnapshot, exportLocalGitHead, type GitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import {
   directorySnapshotSha256,
   disposeDirectorySnapshot,
@@ -28,6 +28,7 @@ import {
 } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import type {
   WorkspaceDurableSeedPaths,
+  WorkspaceGitHeadExport,
   WorkspaceInboundMode,
 } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import { assertWorkspaceManifestDiskSpace, isPathManifest, manifestFileSha256, readManifestRecords, type PathManifest, type WorkspacePaths } from "@paperclipai/adapter-utils/workspace-manifest";
@@ -45,6 +46,8 @@ const DESCRIPTOR_NAME = "descriptor";
 const WORKSPACE_SEED_NAME = "workspace-seed.tar";
 const GIT_SEED_NAME = "git-seed.tar";
 const REMOTE_STAMP_NAME = "workspace-sync-v1.json";
+const EXPORTED_REF_NAME = "exported-ref.json";
+const EXPORTED_REF_PREFIX = "refs/paperclip/runs/";
 const MAX_DESCRIPTOR_BYTES = 64 * 1024 * 1024;
 const SAFE_SEGMENT_RE = /^[A-Za-z0-9_-]+$/;
 
@@ -95,6 +98,14 @@ export interface PreparedNativeWorkspaceSync {
   mode: WorkspaceInboundMode;
   reference: NativeWorkspaceSyncReference;
   restoreWorkspace(assertOwnership?: () => Promise<void>): Promise<void>;
+  /**
+   * Point `localRef` of the host repository at the run workspace's current
+   * `HEAD`. Calls are serialized. The ref is deleted once the final restore
+   * succeeds, by {@link cleanupNativeWorkspaceSync}, or by
+   * `releaseCommitExport` for a ref written after the final restore.
+   */
+  exportCommits(localRef: string): Promise<WorkspaceGitHeadExport>;
+  releaseCommitExport(): Promise<void>;
   cleanup(): Promise<void>;
 }
 
@@ -239,6 +250,21 @@ async function verifiedDurableSeed(input: {
     }
     throw new Error("workspace_sync_out_unrecoverable", { cause: error });
   }
+}
+
+// Recorded beside the descriptor so the ref outlives a server restart exactly
+// as long as the run's sync state does.
+async function recordExportedRef(runId: string, localCwd: string, ref: string): Promise<void> {
+  await fs.writeFile(path.join(descriptorDirectory(runId), EXPORTED_REF_NAME), JSON.stringify({ localCwd, ref }), { mode: 0o600 });
+}
+
+async function deleteExportedRef(runId: string): Promise<void> {
+  const markerPath = path.join(descriptorDirectory(runId), EXPORTED_REF_NAME);
+  const marker = parseObject(await fs.readFile(markerPath, "utf8").then((text) => JSON.parse(text) as unknown, () => null));
+  if (typeof marker.localCwd === "string" && typeof marker.ref === "string" && marker.ref.startsWith(EXPORTED_REF_PREFIX)) {
+    await deleteLocalGitRef({ localDir: marker.localCwd, ref: marker.ref });
+  }
+  await fs.rm(markerPath, { force: true });
 }
 
 async function ensurePrivateDirectory(dir: string): Promise<void> {
@@ -1088,6 +1114,9 @@ export async function prepareNativeWorkspaceSync(input: {
     reason: reuseReason,
   });
   let restorePromise: Promise<void> | null = null;
+  let workspaceFinalized = false;
+  let exportQueue: Promise<unknown> = Promise.resolve();
+  let refExportedAfterFinalize: string | null = null;
   return {
     mode,
     get reference() {
@@ -1114,6 +1143,36 @@ export async function prepareNativeWorkspaceSync(input: {
           });
       }
       await restorePromise;
+      if (!workspaceFinalized) {
+        workspaceFinalized = true;
+        await deleteExportedRef(input.runId).catch(() => undefined);
+      }
+    },
+    exportCommits: (localRef) => {
+      const exported = exportQueue.then(async () => {
+        const localDir = descriptor.binding.localCwd;
+        // After the final restore the host branch holds the run's commits.
+        if (workspaceFinalized) {
+          refExportedAfterFinalize = localRef;
+          return exportLocalGitHead({ localDir, localRef });
+        }
+        if (!preparedRuntime.exportWorkspaceGitHead) throw new Error("workspace_git_unavailable");
+        await recordExportedRef(input.runId, localDir, localRef);
+        const result = await preparedRuntime.exportWorkspaceGitHead({ localRef });
+        // The final restore does not wait for an export in flight; a ref
+        // written after it deleted the ref is removed on release.
+        if (workspaceFinalized) refExportedAfterFinalize = localRef;
+        return result;
+      });
+      exportQueue = exported.catch(() => undefined);
+      return exported;
+    },
+    releaseCommitExport: async () => {
+      await exportQueue;
+      if (refExportedAfterFinalize) {
+        await deleteLocalGitRef({ localDir: descriptor.binding.localCwd, ref: refExportedAfterFinalize });
+        refExportedAfterFinalize = null;
+      }
     },
     cleanup: async () => { await preparedRuntime.cleanupWorkspaceSnapshot?.(); await cleanupNativeWorkspaceSync(input.runId); },
   };
@@ -1223,6 +1282,7 @@ export async function resumeNativeWorkspaceSync(input: {
 }
 
 export async function cleanupNativeWorkspaceSync(runId: string): Promise<void> {
+  await deleteExportedRef(runId).catch(() => undefined);
   await fs.rm(descriptorDirectory(runId), { recursive: true, force: true });
 }
 

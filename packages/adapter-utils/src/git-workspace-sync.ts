@@ -823,6 +823,75 @@ export function buildRemoteGitDeltaBundleScript(input: {
   ].filter(Boolean).join("\n");
 }
 
+/** Point `localRef` at the current `HEAD` of a host workspace, touching nothing else. */
+export async function exportLocalGitHead(input: {
+  localDir: string;
+  localRef: string;
+}): Promise<{ commitSha: string; branch: string | null }> {
+  const head = await runLocalGit(input.localDir, ["rev-parse", "--verify", "HEAD^{commit}"], {
+    timeout: 10_000,
+    maxBuffer: 16 * 1024,
+  }).catch(() => {
+    throw new Error("workspace_git_unavailable");
+  });
+  const commitSha = head.stdout.trim();
+  const branch = await runLocalGit(input.localDir, ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+    timeout: 10_000,
+    maxBuffer: 16 * 1024,
+  }).then((result) => result.stdout.trim() || null, () => null);
+  await runLocalGit(input.localDir, ["update-ref", input.localRef, commitSha], {
+    timeout: 10_000,
+    maxBuffer: 16 * 1024,
+  });
+  return { commitSha, branch };
+}
+
+/**
+ * Bundle one pinned `HEAD` of a workspace that may still be committing.
+ * `HEAD` is read once, so the bundle, the recorded commit and the bundle's
+ * boundary all name the same commit. Writes `<sha>\n<branch or empty>` to
+ * `headInfoPath`. An empty bundle means the host already holds the commit
+ * (`HEAD` is an ancestor of `baseSha`).
+ */
+export function buildRemoteGitHeadExportScript(input: {
+  remoteDir: string;
+  baseSha: string;
+  exportRef: string;
+  bundlePath: string;
+  headInfoPath: string;
+  forceFullBundle?: boolean;
+}): string {
+  const dir = shellQuote(input.remoteDir);
+  const bundlePath = shellQuote(input.bundlePath);
+  const exportRef = shellQuote(input.exportRef);
+  const baseSha = shellQuote(input.baseSha);
+  return [
+    "set -e",
+    `cleanup() { git -C ${dir} update-ref -d ${exportRef} >/dev/null 2>&1 || true; }`,
+    "trap cleanup EXIT",
+    `mkdir -p ${shellQuote(path.posix.dirname(input.bundlePath))}`,
+    `rm -f ${bundlePath}`,
+    `head=$(git -C ${dir} rev-parse --verify HEAD^{commit})`,
+    `git -C ${dir} update-ref ${exportRef} "$head"`,
+    `bundle_base=""`,
+    ...(input.forceFullBundle
+      ? []
+      : [
+        `if git -C ${dir} cat-file -e ${baseSha}^{commit} 2>/dev/null; then`,
+        `  bundle_base=$(git -C ${dir} merge-base ${baseSha} "$head" 2>/dev/null || true)`,
+        "fi",
+      ]),
+    `if [ -n "$bundle_base" ] && [ "$bundle_base" = "$head" ]; then`,
+    `  : > ${bundlePath}`,
+    `elif [ -n "$bundle_base" ]; then`,
+    `  git -C ${dir} bundle create ${bundlePath} ${exportRef} --not "$bundle_base" >/dev/null`,
+    "else",
+    `  git -C ${dir} bundle create ${bundlePath} ${exportRef} >/dev/null`,
+    "fi",
+    `{ printf '%s\\n' "$head"; git -C ${dir} symbolic-ref --quiet --short HEAD || true; } > ${shellQuote(input.headInfoPath)}`,
+  ].join("\n");
+}
+
 // Labels are fixed at the integration call sites, never derived from Git arguments.
 function runIntegrationGit(
   command: WorkspaceRestoreGitCommand,
