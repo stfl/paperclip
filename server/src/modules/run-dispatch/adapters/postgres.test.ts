@@ -1203,6 +1203,48 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       });
     });
 
+    // The comment woke the assignee; the task went to a person before the
+    // queued run was claimed.
+    async function seedCommentWakeForHandedOverTask(adapterType: string) {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      await db.update(agents).set({ adapterType, adapterConfig: { provider: "codex" } }).where(eq(agents.id, agentId));
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const runId = await seedRun({
+        companyId,
+        agentId,
+        contextSnapshot: { issueId, wakeReason: "issue_commented", source: "issue.comment", wakeCommentId: randomUUID() },
+      });
+      await db.update(issues).set({ assigneeAgentId: null, assigneeUserId: "responsible-user" }).where(eq(issues.id, issueId));
+      const outcome = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+      });
+      const run = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, runnerProfileJson: heartbeatRuns.runnerProfileJson })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0]);
+      return { outcome, run };
+    }
+
+    it("cancels a Runner agent's comment wake once the task has changed hands", async () => {
+      const { outcome, run } = await seedCommentWakeForHandedOverTask("paperclip_runner");
+
+      expect(outcome).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+      expect(run).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
+      expect(run?.runnerProfileJson ?? {}).not.toHaveProperty("aiConnectionNonAssigneeCommentWake");
+    });
+
+    it("still delivers a direct-adapter agent's comment wake after the task changed hands", async () => {
+      const { outcome, run } = await seedCommentWakeForHandedOverTask("codex_local");
+
+      expect(outcome).toMatchObject({ outcome: "not_stale" });
+      expect(run).toMatchObject({ status: "queued", runnerProfileJson: { aiConnectionNonAssigneeCommentWake: true } });
+    });
+
     it(
       "reads the locked issue state and cancels in the same semantic transaction",
       async () => {
