@@ -17,6 +17,7 @@ import {
   GIT_SHALLOW_METADATA_EXIT_CODE,
   GIT_SHALLOW_MAX_BYTES,
   GitShallowMetadataError,
+  buildRemoteGitHeadExportScript,
   isMissingGitPrerequisiteError,
   createImportedGitRef,
   createRemoteGitExportRef,
@@ -34,6 +35,7 @@ import {
   ReferencedSourceIgnoreScanLimitExceededError,
   readReferencedSourceGitIgnoredPaths,
   resetLocalGitIndexToHead,
+  runLocalGit,
   withShallowGitWorkspaceClone,
   WORKSPACE_GIT_SCAN_SATURATED_CODE,
 } from "./git-workspace-sync.js";
@@ -644,7 +646,20 @@ export interface PreparedSandboxManagedRuntime {
     repositories?: NonNullable<GitWorkspaceSnapshot["repositories"]>;
   } | null;
   cleanupWorkspaceSnapshot(): Promise<void>;
+  /**
+   * Fetch the target workspace's current `HEAD` commit, with its history, into
+   * `localRef` of the host workspace's repository. Touches no host branch,
+   * index or file and no state `restoreWorkspace` reads, so it is safe while
+   * the agent runs and before the final restore.
+   */
+  exportWorkspaceGitHead(input: { localRef: string }): Promise<WorkspaceGitHeadExport>;
   restoreWorkspace(onProgress?: RuntimeProgressSink): Promise<void>;
+}
+
+export interface WorkspaceGitHeadExport {
+  commitSha: string;
+  /** `null` when the workspace's `HEAD` is detached. */
+  branch: string | null;
 }
 
 export type WorkspaceInboundMode =
@@ -2003,6 +2018,77 @@ export async function prepareSandboxManagedRuntime(input: {
         ? { baseline: baselineSnapshot, gitSnapshot, ...(!gitSnapshot && repositories.length ? { repositories } : {}) }
         : null,
     cleanupWorkspaceSnapshot,
+    exportWorkspaceGitHead: async ({ localRef }) => {
+      if (!syncWorkspace || !gitSnapshot) throw new Error("workspace_git_unavailable");
+      return withTempDir("paperclip-sandbox-head-export-", async (tempDir) => {
+        const exportId = randomUUID();
+        const remoteBundle = path.posix.join(runtimeRootDir, `head-export-${exportId}.bundle`);
+        const remoteHeadInfo = path.posix.join(runtimeRootDir, `head-export-${exportId}.txt`);
+        const exportRef = createRemoteGitExportRef("sandbox-head");
+        const localBundlePath = path.join(tempDir, "head.bundle");
+        const exportOnce = async (forceFullBundle: boolean) => {
+          try {
+            await input.client.run(
+              `sh -c ${shellQuote(buildRemoteGitHeadExportScript({
+                remoteDir: workspaceRemoteDir,
+                baseSha: gitSnapshot.headCommit,
+                exportRef,
+                bundlePath: remoteBundle,
+                headInfoPath: remoteHeadInfo,
+                forceFullBundle,
+              }))}`,
+              { timeoutMs: input.spec.timeoutMs },
+            );
+            const [commitSha = "", branch = ""] = toBuffer(await input.client.readFile(remoteHeadInfo))
+              .toString("utf8").split("\n").map((line) => line.trim());
+            if (!/^[0-9a-f]{40}$/.test(commitSha)) throw new Error("workspace_git_head_unreadable");
+            if (nativeSyncOut) {
+              const operations: SandboxSyncOperation[] = [{
+                operationId: nextSyncOperationId(),
+                files: [{ sourcePath: remoteBundle, targetPath: localBundlePath, kind: "file" }],
+              }];
+              assertSyncOperationsConfined(operations, { sourceRoots: [runtimeRootDir], targetRoots: [tempDir] });
+              await input.client.syncOut!(operations);
+            } else {
+              await fs.writeFile(localBundlePath, toBuffer(await input.client.readFile(remoteBundle)));
+            }
+            if ((await fs.stat(localBundlePath)).size === 0) {
+              // The target claims the host already holds this commit; a host
+              // that does not gets a self-contained bundle on the retry.
+              const held = await runLocalGit(input.workspaceLocalDir, ["cat-file", "-e", `${commitSha}^{commit}`], {
+                timeout: 10_000,
+                maxBuffer: 16 * 1024,
+              }).then(() => true, () => false);
+              if (!held) throw new Error(`lacks these prerequisite commits: ${commitSha}`);
+              await runLocalGit(input.workspaceLocalDir, ["update-ref", localRef, commitSha], {
+                timeout: 10_000,
+                maxBuffer: 16 * 1024,
+              });
+            } else {
+              const imported = await fetchGitBundleIntoLocalRef({
+                localDir: input.workspaceLocalDir,
+                bundlePath: localBundlePath,
+                exportRef,
+                importedRef: localRef,
+                baseSha: commitSha,
+              });
+              if (imported !== commitSha) throw new Error("workspace_git_head_import_mismatch");
+            }
+            return { commitSha, branch: branch || null };
+          } finally {
+            await input.client.remove(remoteBundle).catch(() => undefined);
+            await input.client.remove(remoteHeadInfo).catch(() => undefined);
+            await fs.rm(localBundlePath, { force: true }).catch(() => undefined);
+          }
+        };
+        try {
+          return await exportOnce(false);
+        } catch (error) {
+          if (!isMissingGitPrerequisiteError(error)) throw error;
+          return exportOnce(true);
+        }
+      });
+    },
     restoreWorkspace: async (onProgress?: RuntimeProgressSink) => {
       try {
       const restoreSink = onProgress ?? input.onProgress;

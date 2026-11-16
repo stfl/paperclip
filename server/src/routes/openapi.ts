@@ -7737,6 +7737,28 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/heartbeat-runs/{runId}/workspace/export-commits",
+  tags: ["runs"],
+  summary: "Export a running run's commits to the host repository",
+  description: "Makes the current HEAD commit of the running run's workspace, with its history, present in the host repository of the run's execution workspace under refs/paperclip/runs/{runId}/head. Uncommitted changes are not exported, and the host worktree, index, HEAD and branch are untouched. Callable by the run's own agent or a board user with write access to the run's company. Concurrent calls are serialized; the ref ends at the later HEAD and is deleted when the run's workspace finalization succeeds. Refusals carry a code: run_not_running (409), not_run_agent or no_company_access (403), no_git_workspace or workspace_not_exportable (409), export_failed (502).",
+  request: { params: z.object({ runId: heartbeatRunIdParamSchema }) },
+  responses: {
+    200: r.ok(z.object({
+      commitSha: z.string().regex(/^[0-9a-f]{40}$/),
+      branch: z.string().nullable().describe("Branch checked out in the run's workspace; null when HEAD is detached"),
+      ref: z.string(),
+    })),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    502: r.serverError,
+  },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/heartbeat-runs/{runId}/provider-trace",
   tags: ["runs"],

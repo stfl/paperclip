@@ -628,6 +628,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
         descriptorSha256: "a".repeat(64), baselineSha256: "b".repeat(64), finalHostSha256: null,
         workspaceId: run.id, leaseId: randomUUID(), providerLeaseId: "sandbox", remoteCwd: "/workspace", resourceDisposition: null },
       restoreWorkspace: restore,
+      exportCommits: vi.fn(), releaseCommitExport: vi.fn(async () => {}),
       cleanup: vi.fn(async () => {}),
     };
     try {
@@ -708,6 +709,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
         descriptorSha256: "a".repeat(64), baselineSha256: "b".repeat(64), finalHostSha256: null,
         workspaceId: run.id, leaseId: randomUUID(), providerLeaseId: "sandbox", remoteCwd: "/workspace", resourceDisposition: "destroy" },
       restoreWorkspace: vi.fn(), cleanup: vi.fn(),
+      exportCommits: vi.fn(), releaseCommitExport: vi.fn(async () => {}),
     };
     const error = new Error("runner_remote_process_identity_unavailable");
     vi.mocked(executePaperclipNativeSession).mockRejectedValueOnce(error);
