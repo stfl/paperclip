@@ -3,7 +3,7 @@ import { preDispatchExecutionWaitRecoveryActionPredicate } from "./pre-dispatch-
 import { and, desc, eq, gt, inArray, not, or, sql } from "drizzle-orm";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { z } from "zod";
-import { agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, toolConnections, type Db } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, toolConnections, workspaceOperations, type Db } from "@paperclipai/db";
 import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
@@ -54,6 +54,77 @@ export function executionBlockerPredicate() {
   );
 }
 
+/**
+ * The stopped run handed its own task to another agent, and that reassignment
+ * is what stopped it. Its turn ended at a call whose outcome the task records,
+ * so nothing of it is left to reconcile. The proof is the task update that the
+ * run itself made and that names the run as the one it interrupted. `stopped`
+ * and `task` are the SQL aliases of the stopped run and its task.
+ */
+export function stoppedByOwnHandOffCondition() {
+  return sql`exists (select 1 from ${activityLog} handoff
+    where handoff.company_id = stopped.company_id and handoff.action = 'issue.updated'
+      and handoff.entity_type = 'issue' and handoff.entity_id = task.id::text
+      and handoff.actor_type = 'agent' and handoff.agent_id = stopped.agent_id and handoff.run_id = stopped.id
+      and handoff.details->>'interruptedRunId' = stopped.id::text
+      and handoff.details->>'assigneeAgentId' <> stopped.agent_id::text)`;
+}
+
+/**
+ * A file-preservation hold binds a newer task owner only until automatic
+ * recovery saved the stopped run's files. That owner's turn is a fresh
+ * assignment, not a replay: the stopped run's unknown outcomes stay with its
+ * own agent, which keeps the hold. A run that its own hand-off stopped has no
+ * unknown outcome, so its hold releases for the same agent too when the task
+ * returns to it. The proof is the durable completed-recovery receipt bound to
+ * this action, so later reuse of the workspace by the current owner cannot
+ * re-arm the hold.
+ */
+export function restoreHoldReleasedForCurrentOwnerPredicate() {
+  const sourceRunId = sql`coalesce(${issueRecoveryActions.evidence}->>'runId', ${issueRecoveryActions.evidence}->>'sourceRunId')`;
+  const operationIds = sql`case when jsonb_typeof(${issueRecoveryActions.evidence}#>'{systemRecovery,preservationOperationIds}') = 'array'
+    then ${issueRecoveryActions.evidence}#>'{systemRecovery,preservationOperationIds}' else '[]'::jsonb end`;
+  // JSON reads are NULL for other holds. Callers negate this predicate, so it
+  // must be strictly true or false: NOT NULL would hide unrelated blockers.
+  return sql`coalesce((${and(
+    sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
+    sql`coalesce(${issueRecoveryActions.evidence}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'`,
+    sql`exists (select 1 from ${heartbeatRuns} stopped
+      join ${issues} task on task.company_id = stopped.company_id and task.id = ${issueRecoveryActions.sourceIssueId}
+      where stopped.company_id = ${issueRecoveryActions.companyId}
+        and stopped.id::text = ${sourceRunId}
+        and stopped.status in ('failed', 'timed_out', 'interrupted', 'cancelled')
+        and stopped.finished_at is not null
+        and task.assignee_agent_id is not null
+        and ((task.assignee_agent_id <> stopped.agent_id
+          and not coalesce(task.status = 'in_review'
+            and task.execution_state->>'status' = 'pending'
+            and task.execution_state->'currentParticipant'->>'type' = 'agent'
+            and task.execution_state->'currentParticipant'->>'agentId' = stopped.agent_id::text, false))
+          or ${stoppedByOwnHandOffCondition()}))`,
+    sql`${issueRecoveryActions.evidence}#>>'{systemRecovery,schema}' = 'paperclip.system-recovery.v1'`,
+    sql`${issueRecoveryActions.evidence}#>>'{systemRecovery,sourceRunId}' = ${sourceRunId}`,
+    sql`${issueRecoveryActions.evidence}#>>'{systemRecovery,state}' = 'complete'`,
+    sql`${issueRecoveryActions.evidence}#>>'{workspaceRecovery,schema}' = 'paperclip.workspace-recovery.v1'`,
+    sql`${issueRecoveryActions.evidence}#>>'{workspaceRecovery,runId}' = ${sourceRunId}`,
+    sql`${issueRecoveryActions.evidence}#>>'{workspaceRecovery,status}' = 'recovered'`,
+    sql`jsonb_array_length(${operationIds}) > 0`,
+    // Copyback put the files back into the task workspace that the new owner
+    // reuses. A snapshot-only save keeps the hold.
+    sql`not exists (select 1 from jsonb_array_elements_text(${operationIds}) saved(id) where not exists (
+      select 1 from ${workspaceOperations} op where op.company_id = ${issueRecoveryActions.companyId}
+        and op.issue_id = ${issueRecoveryActions.sourceIssueId} and op.heartbeat_run_id::text = ${sourceRunId}
+        and op.id::text = saved.id and op.status = 'succeeded'
+        and op.metadata->>'recoveryActionId' = ${issueRecoveryActions.id}::text
+        and op.phase = 'workspace_recovery'))`,
+    sql`exists (select 1 from ${workspaceOperations} op where op.company_id = ${issueRecoveryActions.companyId}
+      and op.issue_id = ${issueRecoveryActions.sourceIssueId} and op.heartbeat_run_id::text = ${sourceRunId}
+      and op.phase = 'workspace_finalize' and op.status = 'succeeded'
+      and op.metadata->>'owningService' = 'workspace_recovery'
+      and op.metadata->'preservationOperationIds' = ${operationIds})`,
+  )}), false)`;
+}
+
 export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: { conversationResetCommentId?: string | null }): Promise<ExecutionBlocker | null> {
   const [conversation] = await db.select({ agentId: issues.conversationAgentId,
     boundaryId: issues.conversationBoundaryCommentId, status: issues.status,
@@ -67,6 +138,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
+    not(restoreHoldReleasedForCurrentOwnerPredicate()),
     or(
       unreconciledNativeExportPredicate(),
       sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
@@ -94,6 +166,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
+    not(restoreHoldReleasedForCurrentOwnerPredicate()),
     boundary ? gt(issueRecoveryActions.createdAt, boundary.createdAt) : undefined,
   )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)).limit(1);
   if (!action) return null;
