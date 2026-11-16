@@ -73,6 +73,7 @@ const apiPrefixes: Record<string, string> = {
   "managed-agent-profiles.ts": "/api",
   "onboarding-seed.ts": "/api",
   "openapi.ts": "/api",
+  "run-commit-export.ts": "/api",
   "plugin-ui-static.ts": "/api",
   "plugins.ts": "/api",
   "projects.ts": "/api",
@@ -1299,6 +1300,6 @@ describe("heartbeat run ID OpenAPI contract", () => {
         checked++;
       }
     }
-    expect(checked).toBe(12);
+    expect(checked).toBe(13);
   });
 });
