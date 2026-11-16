@@ -30,7 +30,7 @@ import * as executionTarget from "@paperclipai/adapter-utils/execution-target";
 import * as runnerProbe from "../vendor/paperclip-runner/index.js";
 import * as nativeCodexRunner from "../services/native-runtime/native-codex-runner.js";
 import { testNativeRunnerAuthentication } from "../services/native-runtime/setup-readiness.js";
-import { prepareManagedAiRuntime, withManagedAiProbe, assertManagedAiProjectAuth, isAiConnectionBusy } from "../services/ai-connection-runtime.js";
+import { prepareManagedAiRuntime, managedAiAdapterRuntime, withManagedAiProbe, assertManagedAiProjectAuth, isAiConnectionBusy } from "../services/ai-connection-runtime.js";
 import { execute as executeGemini, testEnvironment as testGeminiEnvironment } from "@paperclipai/adapter-gemini-local/server";
 import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
@@ -74,6 +74,44 @@ beforeAll(async () => {
 afterAll(async () => { await database?.cleanup(); vi.unstubAllEnvs(); if (home) await rm(home, { recursive: true, force: true }); });
 
 describe("managed AI connections", () => {
+  it("keeps Claude transcripts after managed credential cleanup", async () => {
+    const userId = "transcript-user";
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    await create(userId, "transcript-connection");
+    const runInput = { ...input, responsibleUserId: userId, config: { cwd: home } };
+    vi.stubEnv("PAPERCLIP_KEPT_AI_SESSION_COMPANIES", companyId);
+    try {
+      const first = await prepareManagedAiRuntime(db, runInput);
+      await writeFile(path.join(first.home, "provider", "projects", "session.jsonl"), "conversation");
+      await first.cleanup();
+      await expect(access(first.home)).rejects.toMatchObject({ code: "ENOENT" });
+      const second = await prepareManagedAiRuntime(db, runInput);
+      try {
+        expect(await readFile(path.join(second.home, "provider", "projects", "session.jsonl"), "utf8")).toBe("conversation");
+        expect(second.home).not.toBe(first.home);
+      } finally { await second.cleanup(); }
+    } finally { vi.stubEnv("PAPERCLIP_KEPT_AI_SESSION_COMPANIES", ""); }
+  });
+
+  it("hands the adapter the managed home only for a company that keeps sessions", async () => {
+    const userId = "adapter-home-user";
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    await create(userId, "adapter-home-connection");
+    const runInput = { ...input, responsibleUserId: userId, config: { cwd: home } };
+    for (const kept of [companyId, ""]) {
+      vi.stubEnv("PAPERCLIP_KEPT_AI_SESSION_COMPANIES", kept);
+      try {
+        const runtime = await prepareManagedAiRuntime(db, runInput);
+        try {
+          expect(managedAiAdapterRuntime(runtime)).toEqual(kept
+            ? { home: runtime.home, identity: runtime.identity }
+            : undefined);
+        } finally { await runtime.cleanup(); }
+      } finally { vi.stubEnv("PAPERCLIP_KEPT_AI_SESSION_COMPANIES", ""); }
+    }
+    expect(managedAiAdapterRuntime(undefined)).toBeUndefined();
+  });
+
   it.each([
     { provider: "openrouter", envKey: "OPENROUTER_API_KEY", routed: false },
     { provider: "openrouter", envKey: "OPENROUTER_API_KEY", routed: true },
