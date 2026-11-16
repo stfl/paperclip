@@ -4829,7 +4829,9 @@ export function recoveryService(
           issue.companyId,
           issue.id,
           issue.status === "in_review" ? agentId : null,
-          issue.status === "todo" ? { deferredWakeAgentId: agentId } : undefined,
+          issue.status === "todo" || issue.status === "in_progress"
+            ? { deferredWakeAgentId: agentId }
+            : undefined,
         )
       ) {
         result.skipped += 1;
@@ -5852,7 +5854,9 @@ export function recoveryService(
         result.issueIds.push(issue.id);
       } else if (
         recoveryOutcome.retryExhausted &&
-        !(await hasActiveExecutionPath(issue.companyId, issue.id, null))
+        !(await hasActiveExecutionPath(issue.companyId, issue.id, null, {
+          deferredWakeAgentId: agentId,
+        }))
       ) {
         // The failed run's bounded transient retries are all spent, so no
         // successor will ever be queued for it. Escalate rather than skip
