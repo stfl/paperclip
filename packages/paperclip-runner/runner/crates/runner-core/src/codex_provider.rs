@@ -722,7 +722,7 @@ struct ProviderExitDrain {
 // provider child boundary equally explicit: runnerd may inherit a configured
 // entry from this static ceiling, but cannot introduce another environment
 // variable by changing GIT_CONFIG_COUNT.
-const GITHUB_CREDENTIAL_ENVIRONMENT_KEYS: &[&str] = &[
+pub(crate) const GITHUB_CREDENTIAL_ENVIRONMENT_KEYS: &[&str] = &[
     "PAPERCLIP_RUNNER_NETWORK_ACCESS",
     "PAPERCLIP_RUNNER_NETWORK_ROOTS",
     "PAPERCLIP_GITHUB_AUTH_MODE",
