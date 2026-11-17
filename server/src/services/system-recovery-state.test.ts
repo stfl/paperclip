@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { createSystemRecovery, failSystemRecovery, readSystemRecovery, reserveSystemRecoveryAttempt, SystemRecoveryFailure } from "./system-recovery-state.js";
+import { createSystemRecovery, failSystemRecovery, readSystemRecovery, reserveSystemRecoveryAttempt, SYSTEM_RECOVERY_WINDOW_MS, SystemRecoveryFailure } from "./system-recovery-state.js";
 
 describe("durable system recovery budget", () => {
   it("makes six attempts with exponential delays that survive serialization and exhaustion", () => {
@@ -44,6 +44,29 @@ describe("durable system recovery budget", () => {
       new SystemRecoveryFailure("source_binding_invalid", "service_required"));
     expect(state).toMatchObject({ state: "exhausted", nextAttemptAt: null,
       failure: { code: "source_binding_invalid", retryClass: "service_required" } });
+  });
+  it("waits for another run on the task past the retry window without spending a retry", () => {
+    const writer = new SystemRecoveryFailure("workspace_writer_active", "recheck_evidence");
+    let state = createSystemRecovery(randomUUID());
+    let now = 0;
+    state = reserveSystemRecoveryAttempt(state, now)!;
+    state = failSystemRecovery(state, new SystemRecoveryFailure("provider_unavailable", "retry_transient"), { now });
+    for (let attempt = 0; attempt < 12; attempt++) {
+      now = Math.max(now + 5 * 60_000, state.nextAttemptAt!);
+      state = reserveSystemRecoveryAttempt(state, now)!;
+      expect(state).not.toBeNull();
+      state = failSystemRecovery(state, writer, { now });
+      state = readSystemRecovery(JSON.parse(JSON.stringify({ systemRecovery: state })))!;
+      expect(state).toMatchObject({ state: "awaiting_evidence", retriesUsed: 1, deadlineAt: null,
+        failure: { code: "workspace_writer_active" } });
+      expect(state.nextAttemptAt! - now).toBeLessThanOrEqual(30_000);
+    }
+    expect(now).toBeGreaterThan(SYSTEM_RECOVERY_WINDOW_MS);
+    // A real failure once the other run has ended still has the rest of its budget.
+    state = reserveSystemRecoveryAttempt(state, state.nextAttemptAt!)!;
+    expect(state.retriesUsed).toBe(1);
+    state = failSystemRecovery(state, new SystemRecoveryFailure("provider_unavailable", "retry_transient"), { now: state.nextAttemptAt ?? now });
+    expect(state.state).toBe("scheduled");
   });
   it("reads prior incident metadata without losing the local recovery budget or failure", () => {
     const state = failSystemRecovery(createSystemRecovery(randomUUID()),

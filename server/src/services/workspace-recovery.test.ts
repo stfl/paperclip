@@ -426,6 +426,32 @@ describe("automatic retained workspace recovery", () => {
     expect(await readFile(path.join(f.remote, "saved.txt"), "utf8")).toBe("finished work\n");
   }, 30_000);
 
+  it("waits for the new assignee's run past the retry window and recovers once it has ended", async () => {
+    const f = await seed();
+    const receiverId = randomUUID();
+    await db.insert(agents).values({ id: receiverId, companyId: f.companyId, name: "Receiver", adapterType: "paperclip_runner", status: "running" });
+    const [receiverRun] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: receiverId, status: "running",
+      runtimeMode: "native", nativeIssueId: f.issueId, issueId: f.issueId, contextSnapshot: { issueId: f.issueId } }).returning();
+    const start = Date.now();
+    const clock = vi.spyOn(Date, "now");
+    try {
+      for (let minute = 0; minute <= 40; minute += 5) {
+        clock.mockReturnValue(start + minute * 60_000);
+        await recoverRetainedWorkspace(f.input);
+        expect(readSystemRecovery((await action(f.actionId)).evidence)).toMatchObject({ state: "awaiting_evidence",
+          retriesUsed: 0, failure: { code: "workspace_writer_active" } });
+      }
+      expect(f.runtime.resumeRunLease).not.toHaveBeenCalled();
+      expect(readWorkspaceRecovery((await action(f.actionId)).evidence)?.status).toBe("queued");
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, receiverRun.id));
+      clock.mockReturnValue(start + 41 * 60_000);
+      await recoverRetainedWorkspace(f.input);
+    } finally { clock.mockRestore(); }
+    expect(readWorkspaceRecovery((await action(f.actionId)).evidence)?.status).toBe("recovered");
+    expect(await hasVerifiedWorkspaceRepair(db, await run(f.runId))).toBe(true);
+    expect(await readFile(path.join(f.host, "saved.txt"), "utf8")).toBe("finished work\n");
+  }, 60_000);
+
   it("resumes a copied workspace after a lost stop reply without overwriting later files", async () => {
     const f = await seed();
     f.runtime.retryPendingSandboxTeardown.mockRejectedValueOnce(new Error("stop reply lost"));
