@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createRunnerProviderLaunch, preparedRunnerLaunchWorkingDirectory, runnerLaunchRequirementsDigest, validatePreparedRunnerLaunch,
+import { createRunnerProviderLaunch, createRunnerdCodexAppServerArgs, preparedRunnerLaunchWorkingDirectory, runnerLaunchRequirementsDigest, validatePreparedRunnerLaunch,
   type RunnerProviderLaunchEnvironment, type RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
 
 const requirements: RunnerProviderLaunchRequirements = {
@@ -77,5 +77,36 @@ describe("built-in provider launch preparation", () => {
       expect(() => validatePreparedRunnerLaunch(selected, prepared(cwd)))
         .toThrow("runner_prepared_launch_working_directory_invalid");
     }
+  });
+});
+
+describe("sandboxed Codex launch arguments", () => {
+  // Mirrors MAX_CODEX_ARGS, MAX_CODEX_ARG_BYTES and MAX_CODEX_ARGS_TOTAL_BYTES
+  // in runner-core's codex_provider.rs, which refuses a launch past them.
+  const maxArgs = 64, maxArgBytes = 64 * 1024, maxTotalBytes = 256 * 1024;
+  const cwd = "/home/agent/workspace";
+  const root = `${cwd}/.paperclip-runtime/paperclip-runner/sessions/${"0".repeat(64)}/filesystem`;
+  const launchArgs = (skills: number) => createRunnerdCodexAppServerArgs({
+    environment: {
+      HOME: "/home/agent", PATH: "/run/wrappers/bin:/run/current-system/sw/bin", LANG: "C.UTF-8",
+      PAPERCLIP_GIT_METADATA_ROOTS: JSON.stringify([`${cwd}/.git`]),
+      PAPERCLIP_GITHUB_LAUNCHER_DIR: `${root}/launcher`,
+    },
+    codexHome: `${root}/codex-home`, workingDirectory: cwd, runtimeStateRoot: root,
+    instructionWorkingCopyRoot: `${root}/context/instructions-working-copy`,
+    readOnlyRoots: [`${root}/codex-home/skills`, `${root}/context/instructions`,
+      ...Array.from({ length: skills }, (_, index) => `${root}/context/skills/${index}-${"a".repeat(12)}`)],
+  });
+  const bytes = (argument: string) => Buffer.byteLength(argument);
+
+  it("grows one filesystem rule past 4 KiB for an agent with seventeen skills", () => {
+    expect(Math.max(...launchArgs(17).map(bytes))).toBeGreaterThan(4096);
+  });
+
+  it("stays within the runner's launch bounds for the largest explicit skill set", () => {
+    const args = launchArgs(64);
+    expect(args.length).toBeLessThanOrEqual(maxArgs);
+    expect(Math.max(...args.map(bytes))).toBeLessThanOrEqual(maxArgBytes);
+    expect(args.reduce((total, argument) => total + bytes(argument), 0)).toBeLessThanOrEqual(maxTotalBytes);
   });
 });
