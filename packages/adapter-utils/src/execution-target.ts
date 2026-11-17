@@ -21,6 +21,7 @@ import {
 } from "./remote-managed-runtime.js";
 import type {
   AdditionalSourceStagingFailure,
+  PreparedSandboxManagedRuntime,
   SandboxAdditionalSource,
   WorkspaceDurableSeedPaths,
   WorkspaceInboundMode,
@@ -277,6 +278,8 @@ export interface PreparedAdapterExecutionTargetRuntime {
     repositories?: NonNullable<GitWorkspaceSnapshot["repositories"]>;
   } | null;
   cleanupWorkspaceSnapshot?(): Promise<void>;
+  /** Present only for a sandbox target. See {@link PreparedSandboxManagedRuntime.exportWorkspaceGitHead}. */
+  exportWorkspaceGitHead?: PreparedSandboxManagedRuntime["exportWorkspaceGitHead"];
   restoreWorkspace(onProgress?: RuntimeProgressSink): Promise<void>;
 }
 
@@ -1570,6 +1573,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     additionalSourceFailures: prepared.additionalSourceFailures,
     workspaceSyncSnapshot: prepared.workspaceSyncSnapshot,
     cleanupWorkspaceSnapshot: prepared.cleanupWorkspaceSnapshot,
+    exportWorkspaceGitHead: prepared.exportWorkspaceGitHead,
     restoreWorkspace: prepared.restoreWorkspace,
   };
 }
