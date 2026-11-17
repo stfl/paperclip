@@ -45,7 +45,7 @@ import { executionProjectionForRun, executionProjectionsForRuns } from "../servi
 import { selectDashboardRunIds } from "../services/dashboard-run-selection.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
-import { readFile, rm } from "node:fs/promises";
+import { readFile, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
@@ -2682,6 +2682,53 @@ export function agentRoutes(
     );
   }
 
+  // The sandbox of a confined run is the board's to set: an agent key may not
+  // set, change or remove any of these keys on any agent's configuration,
+  // whatever the route and whether the key is named or dropped by replacing the
+  // configuration.
+  const AGENT_SANDBOX_SCOPE_KEYS = [
+    "filesystemScope",
+    "networkScope",
+    "filesystemExtraPaths",
+    "filesystemSandboxCommand",
+  ] as const;
+  // The adapters whose runs honour them; any other ignores them.
+  const SANDBOX_ADAPTER_TYPES = new Set(["claude_local", "codex_local"]);
+
+  function hasSandboxSettings(config: unknown): boolean {
+    const record = asRecord(config) ?? {};
+    return AGENT_SANDBOX_SCOPE_KEYS.some((key) => record[key] !== undefined && record[key] !== null);
+  }
+
+  function assertNoAgentSandboxScopeMutation(req: Request, beforeConfig: unknown, afterConfig: unknown) {
+    if (req.actor.type !== "agent") return;
+    const before = asRecord(beforeConfig) ?? {};
+    const after = asRecord(afterConfig) ?? {};
+    const changedKeys = AGENT_SANDBOX_SCOPE_KEYS.filter(
+      (key) => JSON.stringify(before[key] ?? null) !== JSON.stringify(after[key] ?? null),
+    );
+    if (changedKeys.length > 0) {
+      throw forbidden(`Only the board can change the sandbox settings of an agent (${changedKeys.join(", ")}).`);
+    }
+  }
+
+  // An agent key may not move an agent with sandbox settings to another adapter,
+  // and nobody may give sandbox settings to an adapter that would ignore them.
+  function assertSandboxAdapterType(
+    req: Request,
+    previousType: string | null,
+    previousConfig: unknown,
+    nextType: string,
+    nextConfig: unknown,
+  ) {
+    if (req.actor.type === "agent" && previousType && previousType !== nextType && hasSandboxSettings(previousConfig)) {
+      throw forbidden("Only the board can change the adapter of an agent with sandbox settings.");
+    }
+    if (hasSandboxSettings(nextConfig) && !SANDBOX_ADAPTER_TYPES.has(nextType)) {
+      throw unprocessable(`Adapter type "${nextType}" does not enforce sandbox settings; remove them first.`);
+    }
+  }
+
   function summarizeAgentUpdateDetails(patch: Record<string, unknown>) {
     const changedTopLevelKeys = Object.keys(patch).sort();
     const details: Record<string, unknown> = { changedTopLevelKeys };
@@ -3192,6 +3239,20 @@ export function agentRoutes(
       const companyId = req.params.companyId as string;
       let type = assertKnownAdapterType(req.params.type as string);
       await assertCanCreateAgentsForCompany(req, companyId);
+
+      // The adapter's environment test runs the configured command unsandboxed on
+      // the host. An agent key may test only a command that lies in the Nix store,
+      // the rule a confined run's own sandbox applies.
+      const configuredCommand =
+        typeof req.body?.adapterConfig?.command === "string" ? req.body.adapterConfig.command.trim() : "";
+      if (req.actor.type === "agent" && configuredCommand) {
+        const real = path.isAbsolute(configuredCommand) ? await realpath(configuredCommand).catch(() => "") : "";
+        if (!real.startsWith("/nix/store/")) {
+          throw unprocessable(
+            "Paperclip host refuses the environment test: an agent key may test only an adapter command in the Nix store.",
+          );
+        }
+      }
 
       const requestedBinding = req.body.aiConnection ? aiRuntimeConnectionBindingSchema.parse(req.body.aiConnection) : undefined;
       const aiBinding = requestedBinding?.mode === "router" ? undefined : requestedBinding;
@@ -4196,6 +4257,8 @@ export function agentRoutes(
     if (req.actor.type === "agent" && rollbackAdapterConfig.homeMode !== asRecord(existing.adapterConfig)?.homeMode)
       throw forbidden("Only an operator can configure Runner homeMode.");
     assertNoAgentLocalAdapterHostCommandMutation(req, rollbackAdapterType, rollbackAdapterConfig);
+    assertNoAgentSandboxScopeMutation(req, existing.adapterConfig, rollbackAdapterConfig);
+    assertSandboxAdapterType(req, existing.adapterType, existing.adapterConfig, rollbackAdapterType, rollbackAdapterConfig);
     assertNoAgentProcessAdapterMutation(
       req,
       rollbackAdapterType,
@@ -4372,6 +4435,7 @@ export function agentRoutes(
     assertProviderTraceSettingTransition(req, hireInput.runtimeConfig);
     assertNoAgentAdapterConfigMutation(req, requestedHireConfig);
     assertNoAgentLocalAdapterHostCommandMutation(req, hireInput.adapterType ?? "process", requestedHireConfig, await callerUsesAiConnectionPool(req, companyId));
+    assertNoAgentSandboxScopeMutation(req, {}, requestedHireConfig);
     assertNoAgentProcessAdapterMutation(req, hireInput.adapterType ?? "process", Object.keys(requestedHireConfig).length > 0);
     assertExternalInstructionsAdmin(req, { id: hiredAgentId, companyId, name: hireInput.name, adapterConfig: requestedHireConfig });
 
@@ -4413,6 +4477,8 @@ export function agentRoutes(
     );
     assertNoAgentAdapterConfigMutation(req, rawHireAdapterConfig);
     assertNoAgentLocalAdapterHostCommandMutation(req, hireInput.adapterType, rawHireAdapterConfig, await callerUsesAiConnectionPool(req, companyId));
+    assertNoAgentSandboxScopeMutation(req, {}, rawHireAdapterConfig);
+    assertSandboxAdapterType(req, null, {}, hireInput.adapterType, rawHireAdapterConfig);
     assertNoAgentProcessAdapterMutation(req, hireInput.adapterType, Object.keys(rawHireAdapterConfig).length > 0);
     const authInheritance = await applyHiringAgentAuthInheritance(
       req,
@@ -4731,6 +4797,7 @@ export function agentRoutes(
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
     assertNoAgentAdapterConfigMutation(req, requestedCreateConfig);
     assertNoAgentLocalAdapterHostCommandMutation(req, createInput.adapterType ?? "process", requestedCreateConfig, await callerUsesAiConnectionPool(req, companyId));
+    assertNoAgentSandboxScopeMutation(req, {}, requestedCreateConfig);
     assertNoAgentProcessAdapterMutation(req, createInput.adapterType ?? "process", Object.keys(requestedCreateConfig).length > 0);
     assertExternalInstructionsAdmin(req, { id: agentId, companyId, name: createInput.name, adapterConfig: requestedCreateConfig });
     Object.assign(createInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...createInput, runner: createRunner, setupOnly: Boolean(setupId) }));
@@ -4748,6 +4815,8 @@ export function agentRoutes(
     );
     assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
     assertNoAgentLocalAdapterHostCommandMutation(req, createInput.adapterType, rawCreateAdapterConfig, await callerUsesAiConnectionPool(req, companyId));
+    assertNoAgentSandboxScopeMutation(req, {}, rawCreateAdapterConfig);
+    assertSandboxAdapterType(req, null, {}, createInput.adapterType, rawCreateAdapterConfig);
     assertNoAgentProcessAdapterMutation(req, createInput.adapterType, Object.keys(rawCreateAdapterConfig).length > 0);
     const requestedAdapterConfig = applyCodexLocalKeyIsolation(
       companyId,
@@ -4961,6 +5030,9 @@ export function agentRoutes(
     const explicitKey = asNonEmptyString(req.body.adapterConfigKey);
     const defaultKey = resolveInstructionsPathKey(existing.adapterType);
     const adapterConfigKey = explicitKey ?? defaultKey;
+    if (adapterConfigKey && adapterConfigKey !== defaultKey && !KNOWN_INSTRUCTIONS_PATH_KEYS.has(adapterConfigKey)) {
+      throw unprocessable("adapterConfigKey must name an instructions path key.");
+    }
     if (!adapterConfigKey) {
       res.status(422).json({
         error: `No default instructions path key for adapter type '${existing.adapterType}'. Provide adapterConfigKey.`,
@@ -4982,6 +5054,7 @@ export function agentRoutes(
       syncedAdapterConfig,
       { strictMode: strictSecretsMode, adapterType: existing.adapterType },
     );
+    assertNoAgentSandboxScopeMutation(req, existingAdapterConfig, normalizedAdapterConfig);
     const actor = getActorInfo(req);
     const agent = await svc.update(
       id,
@@ -5067,6 +5140,7 @@ export function agentRoutes(
       adapterConfig,
       { strictMode: strictSecretsMode, adapterType: existing.adapterType },
     );
+    assertNoAgentSandboxScopeMutation(req, existing.adapterConfig, normalizedAdapterConfig);
     await svc.update(
       id,
       { adapterConfig: normalizedAdapterConfig },
@@ -5185,6 +5259,7 @@ export function agentRoutes(
       result.adapterConfig,
       { strictMode: strictSecretsMode, adapterType: existing.adapterType },
     );
+    assertNoAgentSandboxScopeMutation(req, existing.adapterConfig, normalizedAdapterConfig);
     await svc.update(
       id,
       { adapterConfig: normalizedAdapterConfig },
@@ -5531,6 +5606,8 @@ export function agentRoutes(
         setupOnly: existing.lifecycleHolds?.includes("setup"),
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
+      assertNoAgentSandboxScopeMutation(req, existing.adapterConfig, patchData.adapterConfig);
+      assertSandboxAdapterType(req, existing.adapterType, existing.adapterConfig, requestedAdapterType, patchData.adapterConfig);
       assertExternalInstructionsAdmin(req, {
         ...existing,
         adapterConfig: patchData.adapterConfig,

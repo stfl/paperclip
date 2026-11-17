@@ -5576,6 +5576,30 @@ describe("company portability", () => {
     expect(agentSvc.create).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["an agent's import may not create an agent with sandbox settings", true, "codex_local", /Only the board can set the sandbox settings of an agent \(filesystemScope\)/],
+    ["no import gives sandbox settings to an adapter that ignores them", false, "gemini_local", /Adapter type "gemini_local" does not enforce sandbox settings/],
+  ])("%s", async (_label, agentActor, adapterType, message) => {
+    const portability = companyPortabilityService({} as any);
+    const exported = await portability.exportBundle("company-1", {
+      include: { company: true, agents: true, projects: false, issues: false },
+    });
+    agentSvc.list.mockResolvedValue([]);
+
+    await expect(portability.importBundle({
+      source: { type: "inline", rootPath: exported.rootPath, files: exported.files },
+      include: { company: false, agents: true, projects: false, issues: false },
+      target: { mode: "existing_company", companyId: "company-1" },
+      agents: ["claudecoder"],
+      collisionStrategy: "rename",
+      adapterOverrides: {
+        claudecoder: { adapterType, adapterConfig: { filesystemScope: "workspace" } },
+      },
+    }, "user-1", { mode: "agent_safe", sourceCompanyId: "company-1", agentActor })).rejects.toThrow(message);
+
+    expect(agentSvc.create).not.toHaveBeenCalled();
+  });
+
   it("reports unsafe project workspace commands on agent-safe import preview", async () => {
     const portability = companyPortabilityService({} as any);
 
