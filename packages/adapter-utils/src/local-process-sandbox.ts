@@ -597,7 +597,10 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
         }
       }
     };
-    for (const executablePath of await executableReadPaths(input.executable)) await mount(executablePath, "ro");
+    // Only the command's own Nix store paths: the host has refused any other command.
+    for (const executablePath of await executableReadPaths(input.executable)) {
+      if (executablePath.startsWith("/nix/store/")) await mount(executablePath, "ro");
+    }
     if (networkScope === "allowlist") {
       for (const nodePath of await executableReadPaths(process.execPath)) await mount(nodePath, "ro");
     }
