@@ -23,6 +23,11 @@ import { WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE } from "@paperclipai/adapter-utils/
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { decideGrokAuthMerge } from "@paperclipai/adapter-grok-local/server";
+import {
+  managedAiHomeEnvironment,
+  managedAiSessionEnvironment,
+} from "@paperclipai/adapter-utils/managed-ai-home";
+import { linkManagedAiSessionState } from "./managed-ai-session-state.js";
 
 export function isAiConnectionBusy(error: unknown): error is HttpError {
   return error instanceof HttpError && error.status === 422 &&
@@ -189,30 +194,16 @@ done`,
   }
 }
 
-function managedAiHomeEnvironment(home: string): Record<string, string> {
-  const providerHome = path.join(home, "provider");
-  return {
-    HOME: home,
-    XDG_CONFIG_HOME: path.join(home, "config"),
-    XDG_DATA_HOME: path.join(home, "data"),
-    CODEX_HOME: providerHome,
-    GROK_HOME: providerHome,
-    CLAUDE_CONFIG_DIR: providerHome,
-    HERMES_HOME: providerHome,
-  };
-}
-
 /** Only the server-created credential home is volatile; retain all other config. */
 export function managedAiSessionFingerprintConfig(
   config: Record<string, unknown>,
   managedHome: string | undefined,
 ): Record<string, unknown> {
   if (!managedHome) return config;
-  const env = { ...(config.env as Record<string, unknown> | undefined) };
-  const stable = managedAiHomeEnvironment("<managed-ai-home>");
-  for (const [key, value] of Object.entries(managedAiHomeEnvironment(managedHome))) {
-    if (env[key] === value) env[key] = stable[key];
-  }
+  const env: Record<string, unknown> = managedAiSessionEnvironment(
+    (config.env as Record<string, unknown> | undefined) ?? {},
+    managedHome,
+  );
   const managed = config.managedAiConnection as Record<string, unknown> | undefined;
   if (managed?.sessionIdentity) {
     for (const key of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY", "GROK_API_KEY", "OPENCODE_AUTH_JSON", "OPENCODE_CONFIG_CONTENT"]) {
@@ -320,6 +311,14 @@ export async function prepareManagedAiRuntime(
     );
     const providerHome = path.join(home, "provider");
     await mkdir(providerHome, { mode: 0o700 });
+    const sessionStateKept = await linkManagedAiSessionState({
+      home,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      grantId: selection.grant.id,
+      responsibleUserId: input.responsibleUserId,
+      harness,
+    });
     const env: Record<string, unknown> = {
       ...stripAiAuthBindings(input.config.env),
       ...Object.fromEntries(AI_AUTH_ENV_KEYS.map((key) => [key, ""])),
@@ -412,6 +411,7 @@ export async function prepareManagedAiRuntime(
       accountOwnerUserId: selection.grant.subjectUserId,
       identity,
       home,
+      sessionStateKept,
       cleanup: async () => {
         if (subscriptionFile) {
           const refreshed = await readFile(authFile, "utf8");
@@ -498,6 +498,17 @@ export async function prepareManagedAiRuntime(
     if (home) await rm(home, { recursive: true, force: true });
     throw error;
   }
+}
+
+/**
+ * The managed home an adapter may treat as one session across runs. A home
+ * whose transcripts the run's end deletes must keep the per-run session key,
+ * or the next run resumes a session record whose transcript is gone.
+ */
+export function managedAiAdapterRuntime(
+  runtime: Pick<Awaited<ReturnType<typeof prepareManagedAiRuntime>>, "home" | "identity" | "sessionStateKept"> | undefined,
+): { home: string; identity: string } | undefined {
+  return runtime?.sessionStateKept ? { home: runtime.home, identity: runtime.identity } : undefined;
 }
 
 /** Manual tests/adoption have no heartbeat row for quota's active-run guard.
