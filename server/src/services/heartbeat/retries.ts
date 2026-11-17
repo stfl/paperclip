@@ -87,6 +87,7 @@ export interface HeartbeatRetryDependencies {
     options?: Parameters<HeartbeatRunState["getRun"]>[1],
   ) => Promise<Awaited<ReturnType<HeartbeatRunState["getRun"]>> | null | undefined>;
   resolveSessionBeforeForWakeup: HeartbeatRunState["resolveSessionBeforeForWakeup"];
+  getTaskSession: HeartbeatRunState["getTaskSession"];
   resolveResponsibleUserIdForRunContext: ReturnType<typeof createHeartbeatRunPreparation>["resolveResponsibleUserIdForRunContext"];
   getAgentInvokability: (agent: typeof agents.$inferSelect | null | undefined) => ReturnType<typeof evaluateAgentInvokabilityFromDb>;
   appendRunEvent: (run: HeartbeatRun, event: {
@@ -394,6 +395,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     getAgentInvokability,
     runDispatch,
     resolveSessionBeforeForWakeup,
+    getTaskSession,
     resolveResponsibleUserIdForRunContext,
     recordPlanApprovalResumeFailureRetry,
     setRunStatusIfRunning,
@@ -642,9 +644,22 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     const shouldQuarantineWorkspaceForRetry =
       workspaceValidationRetryPayload !== null &&
       Object.keys(workspaceValidationRetryPayload).length > 0;
+    // A retry drops the fresh-session request when the task session's
+    // lastRunId is the failed run: the retry then resumes the session that
+    // attempt saved. A workspace reconstruction chain requires the request on
+    // every retry.
+    const failedAttemptSession =
+      taskKey &&
+      contextSnapshot.forceFreshSession === true &&
+      typeof contextSnapshot.workspaceReconstructionActionId !== "string"
+        ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
+        : null;
+    const { forceFreshSession: _forceFreshSession, ...resumedContextSnapshot } = contextSnapshot;
+    const inheritedContextSnapshot =
+      failedAttemptSession?.lastRunId === run.id ? resumedContextSnapshot : contextSnapshot;
     const retryContextSnapshot: Record<string, unknown> = withRecoveryContext(
       {
-        ...contextSnapshot,
+        ...inheritedContextSnapshot,
         executionRetryAccounting: accountingForScheduledRetry(run, retryReason, schedule.attempt),
         retryOfRunId: run.id,
         wakeReason,
