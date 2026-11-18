@@ -1171,6 +1171,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       mode: "agent_safe",
       sourceCompanyId: companyId,
       pauseAutomations: body.pauseAutomations === true,
+      agentActor: req.actor.type === "agent",
     });
     await logActivity(db, {
       companyId: result.company.id,
