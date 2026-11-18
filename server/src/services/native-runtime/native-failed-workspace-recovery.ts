@@ -81,6 +81,36 @@ export async function preserveNativeFailedWorkspace(db: Db, selected: typeof hea
   });
 }
 
+export async function preserveOrphanedNativeWorkspace(db: Db, lease: Pick<typeof environmentLeases.$inferSelect,
+  "companyId" | "heartbeatRunId">): Promise<boolean> {
+  if (!lease.heartbeatRunId) return false;
+  const [run] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, lease.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId),
+    eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "failed"),
+  )).limit(1);
+  if (!run || hasRequiredWorkspaceRecovery(run.resultJson)) return false;
+  try {
+    const retained = await preserveNativeFailedWorkspace(db, run);
+    return Boolean(retained && hasRequiredWorkspaceRecovery(retained.resultJson));
+  } catch (error) {
+    if (error instanceof NativeWorkspaceFinalizationBusyError) return false;
+    const code = retentionContentionCode(error);
+    if (!code) throw error;
+    logger.warn({ runId: run.id, code }, "Native workspace retention is waiting for its current owner");
+    return false;
+  }
+}
+
+function retentionContentionCode(error: unknown): string | null {
+  let current = error;
+  for (let depth = 0; depth < 4 && current && typeof current === "object"; depth++) {
+    const value = current as { code?: unknown; cause?: unknown };
+    if (value.code === "55P03" || value.code === "57014") return value.code;
+    current = value.cause;
+  }
+  return null;
+}
+
 const cancelledWorkspaceCursors = new WeakMap<Db, string>();
 
 /** Older controllers could acknowledge Stop without pinning prepared files.
@@ -113,13 +143,7 @@ export async function preserveCancelledNativeWorkspaces(db: Db) {
       try { await preserveNativeFailedWorkspace(db, run, { allowPreterminal: true }); }
       catch (error) {
         if (error instanceof NativeWorkspaceFinalizationBusyError) continue;
-        let current: unknown = error;
-        let code: string | null = null;
-        for (let depth = 0; depth < 4 && current && typeof current === "object"; depth++) {
-          const value = current as { code?: unknown; cause?: unknown };
-          if (value.code === "55P03" || value.code === "57014") { code = value.code; break; }
-          current = value.cause;
-        }
+        const code = retentionContentionCode(error);
         if (!code) throw error;
         logger.warn({ runId: run.id, code }, "Cancelled native workspace retention is waiting for its current owner");
       }
