@@ -74,7 +74,7 @@ import {
   createHeartbeatRecovery,
 } from "./heartbeat/recovery.js";
 import {
-  BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+  boundedRetryMaxAttemptsForRun,
   isWorkspaceBusyDeferral,
   createHeartbeatRetries,
 } from "./heartbeat/retries.js";
@@ -960,8 +960,7 @@ export function heartbeatService(
     // or interrupted run that has already consumed every bounded transient
     // attempt cannot be retried again through this lane.
     transientRetryBudgetSpent: (run) =>
-      executionFailureRetryCount(run) >=
-      BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+      executionFailureRetryCount(run) >= boundedRetryMaxAttemptsForRun(run),
   });
   const runDispatch = createRunDispatch(db);
   const {
