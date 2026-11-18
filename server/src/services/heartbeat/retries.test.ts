@@ -22,6 +22,7 @@ function callbacks() {
     getRun: vi.fn<HeartbeatRetryDependencies["getRun"]>(async () => null),
     getAgent: vi.fn<HeartbeatRetryDependencies["getAgent"]>(async () => undefined),
     resolveSessionBeforeForWakeup: vi.fn(async () => null),
+    getTaskSession: vi.fn(async () => null as never),
     resolveResponsibleUserIdForRunContext: vi.fn(async () => "retry-user"),
     getAgentInvokability: vi.fn<HeartbeatRetryDependencies["getAgentInvokability"]>(async () => ({ invokable: true })),
     appendRunEvent: vi.fn<HeartbeatRetryDependencies["appendRunEvent"]>(async () => undefined),
@@ -212,7 +213,7 @@ describePostgres("heartbeat retry module database wiring", () => {
     const deps = {
       ...callbacks(), getRun: state.getRun, getAgent: state.getAgent,
       hasCaseHandoffForRun: async (run: Pick<Run, "id" | "companyId">) => Boolean(await pendingCaseHandoffForRun(db, run.id, run.companyId)),
-      resolveSessionBeforeForWakeup: state.resolveSessionBeforeForWakeup,
+      resolveSessionBeforeForWakeup: state.resolveSessionBeforeForWakeup, getTaskSession: state.getTaskSession,
       getAgentInvokability: (agent: Agent | null | undefined) => evaluateAgentInvokabilityFromDb(db, agent),
       runDispatch: createRunDispatch(db),
     };
