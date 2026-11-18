@@ -4,7 +4,7 @@ import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
 import { promptInjectionPreventionService } from "./prompt-injection-prevention.js";
 import { createHeartbeatAgentStatus } from "./heartbeat/agent-status.js";
 import { heartbeatExternalProvider, nativeRuntimeHasInstructionFilesystem } from "./heartbeat/external-provider.js";
-import { pendingCaseHandoffForRun, recordCaseHandoffExecutionReleased, recordLegacyCaseHandoffCleanupIntent, recordLegacyCaseHandoffCleanupVerified } from "./heartbeat/case-handoff-lifecycle.js";
+import { pendingCaseHandoffForRun, recordCaseHandoffExecutionReleased, recordLegacyCaseHandoffCleanupIntent, recordLegacyCaseHandoffCleanupVerified, recordProcessIdentityWithLegacyCleanupIntent } from "./heartbeat/case-handoff-lifecycle.js";
 import { hasStoppedLocalProcessTree, legacyAdapterNeedsLocalProcessSettlement } from "./heartbeat/process-settlement.js";
 import { dotRunnerBroker } from "./dot-runner-broker.js";
 import { withRunExecutionTiming, measureRunPhase, measureWorkspaceSyncPhase, isWorkspaceSyncDetailPhase } from "./execution-preparation-timing.js";
@@ -3413,13 +3413,9 @@ export function heartbeatService(
               }
               // Bind cleanup intent to this exact process generation in the
               // same commit as its host-observed PID/group/start identity.
-              return retryTransientRunWrite(() => db.transaction(async transaction => {
-                const tx = transaction as unknown as Db;
-                const persisted = await persistHeartbeatRunProcessMetadata(tx, processRunId, meta);
-                await recordLegacyCaseHandoffCleanupIntent(tx, { runId: processRunId, issueId,
-                  controllerBootId: legacyControllerBootId, scratch: runScratch });
-                return persisted;
-              }));
+              return retryTransientRunWrite(() => recordProcessIdentityWithLegacyCleanupIntent(db,
+                { runId: processRunId, issueId, controllerBootId: legacyControllerBootId, scratch: runScratch },
+                tx => persistHeartbeatRunProcessMetadata(tx, processRunId, meta)));
             },
             recordCurrentHeartbeatRunRuntimeProgress,
             dispatchPendingNativeStatusWakeups,
