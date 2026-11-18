@@ -463,6 +463,13 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
               "adapter_failed")
             : null;
 
+    let sessionStatePersisted = false;
+    async function persistSessionStateOnce(finalizedRun: Run) {
+      if (sessionStatePersisted) return;
+      sessionStatePersisted = true;
+      await persistSessionState(finalizedRun);
+    }
+
     async function persistSessionState(finalizedRun: Run) {
       await updateRuntimeState(
         agent,
@@ -913,6 +920,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
         const policy = parseMaxTurnContinuationPolicy(agent);
         if (policy.enabled && policy.maxAttempts > 0) {
+          await persistSessionStateOnce(livenessRun);
           await scheduleBoundedRetryForRun(livenessRun, agent, {
             retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
             wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON,
@@ -936,6 +944,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         outcome === "failed" &&
         readTransientRecoveryContractFromRun(livenessRun)
       ) {
+        await persistSessionStateOnce(livenessRun);
         await scheduleBoundedRetryForRun(livenessRun, agent);
       } else if (
         outcome === "failed" &&
@@ -1038,7 +1047,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     }
 
     if (finalizedRun) {
-      await persistSessionState(finalizedRun);
+      await persistSessionStateOnce(finalizedRun);
     }
     await settleAgent();
   }
