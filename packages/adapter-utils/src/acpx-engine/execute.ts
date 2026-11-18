@@ -279,6 +279,8 @@ export interface AcpxEngineBillingIdentity {
   provider?: string | null;
   biller?: string | null;
   billingType?: AdapterBillingType | null;
+  /** Usage rows name the model the run requested, not the bridge's current-model alias. */
+  preferRequestedModel?: boolean;
 }
 
 /**
@@ -5038,7 +5040,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // Snapshot pre-turn usage so cumulative agent-reported cost can be
         // attributed to this run alone.
         preTurnStatus = await readRuntimeStatus(runtime, sessionHandle);
-        accountingModel = acpxAccountingModel(prepared.requestedModel, preTurnStatus, null);
+        accountingModel = acpxAccountingModel(prepared.requestedModel, preTurnStatus, null, { preferRequested: billingIdentity?.preferRequestedModel });
         // The prepare phase (prompt build + usage snapshot) finished; the turn
         // phase starts next.
         await emitPhase("prepare_turn", preparePhaseStart, "ok");
@@ -5327,7 +5329,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const turnSucceeded = terminal.status === "completed" && !timedOut && !channelLost;
         // Read usage before the settlement can discard runtime state.
         const postTurnStatus = await readRuntimeStatus(runtime, sessionHandle);
-        accountingModel = acpxAccountingModel(prepared.requestedModel, preTurnStatus, postTurnStatus);
+        accountingModel = acpxAccountingModel(prepared.requestedModel, preTurnStatus, postTurnStatus, { preferRequested: billingIdentity?.preferRequestedModel });
         const turnUsage = summarizeAcpxTurnUsage({
           preStatus: preTurnStatus,
           postStatus: postTurnStatus,
