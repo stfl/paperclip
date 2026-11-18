@@ -36,19 +36,22 @@ export function useAgentLifecycleStatus(agent?: Agent) {
     queryFn: () => agentsApi.get(agent!.id, agent!.companyId),
     enabled: Boolean(agent),
     select: current => ({ status: current.status, lifecycleState: current.lifecycleState,
-      lifecycleVersion: current.lifecycleVersion, lifecycleError: current.lifecycleError }),
+      lifecycleVersion: current.lifecycleVersion, lifecycleError: current.lifecycleError,
+      lifecycleWait: current.lifecycleWait }),
     refetchInterval: query => agentLifecycleRefetchInterval(query.state.data?.lifecycleState ?? agent?.lifecycleState),
   });
 }
 
 export function AgentLifecycleStatus({ agent, onRetry, retryPending, refreshError = false }: {
-  agent: Pick<Agent, "lifecycleState" | "lifecycleError">;
+  agent: Pick<Agent, "lifecycleState" | "lifecycleError" | "lifecycleWait">;
   onRetry: () => void;
   retryPending: boolean;
   refreshError?: boolean;
 }) {
   const phase = pendingPhase(agent.lifecycleState);
   if (!phase && !refreshError) return null;
+  // A long wait is not a failure: the step is still retried.
+  const wait = agent.lifecycleError ? null : agent.lifecycleWait;
   return <div role="status" aria-live="polite" className="space-y-2 text-sm">
     {refreshError && <p className="text-destructive">Could not refresh agent lifecycle status.</p>}
     {phase && <div className="flex flex-wrap items-center gap-2">
@@ -56,7 +59,10 @@ export function AgentLifecycleStatus({ agent, onRetry, retryPending, refreshErro
         {!agent.lifecycleError && <Loader2 aria-hidden="true" className="mr-1 size-3 animate-spin motion-reduce:animate-none" />}
         {agent.lifecycleError ? failedPhases[agent.lifecycleState as keyof typeof failedPhases] : phase[0]}
       </Badge>
-      {!agent.lifecycleError && <span className="text-muted-foreground">{phase[1]}</span>}
+      {!agent.lifecycleError && <span className="text-muted-foreground">{wait ?? phase[1]}</span>}
+      {wait && <Button variant="outline" size="sm" disabled={retryPending} onClick={onRetry}>
+        {retryPending ? "Checking…" : "Check now"}
+      </Button>}
     </div>}
     {phase && agent.lifecycleError && <div className="flex flex-wrap items-center gap-2 text-destructive">
       <span>{agent.lifecycleError}</span>
