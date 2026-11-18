@@ -96,6 +96,7 @@ import type { NativeExecutionInput, NativeSessionBackend } from "../../vendor/pa
 import type { PluginWorkerManager } from "../plugin-worker-manager.js";
 import type { RealizedExecutionWorkspace } from "../workspace-runtime.js";
 import type { reserveWarmNativeInstructionDirectory } from "../native-runtime/index.js";
+import { registerRunCommitExport, runCommitExporterFor } from "./run-commit-export.js";
 
 type Selection = HeartbeatRuntimeSelectionInput;
 type Selected = Extract<HeartbeatRuntimeSelectionResult, { selected: true }>;
@@ -503,6 +504,12 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
   const runGoalControlRequestId = readNonEmptyString(
     context.goalControlRequestId,
   );
+  const releaseCommitExport = registerRunCommitExport(run.id, runCommitExporterFor({
+    runId: run.id,
+    executionTarget,
+    nativeWorkspaceSync,
+    hostWorkspaceDir: executionWorkspace.cwd,
+  }));
   try {
     if (nativeRuntimeResolution.kind === "native") {
       if (!nativeExecution || !nativeRunnerInstanceId)
@@ -1172,6 +1179,9 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
     }
     await nativeInstructionReservation?.release();
     await withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy);
+    await releaseCommitExport().catch((releaseErr) => {
+      logger.warn({ err: releaseErr, runId: run.id }, "failed to release the run's commit export");
+    });
   }
   return { dispatched: true, adapterResult };
 }

@@ -214,6 +214,7 @@ API: `present` — representative operation IDs:
 - `GET /api/companies/{companyId}/live-runs`.
 - `GET /api/issues/{id}/runs`.
 - `GET /api/issues/{id}/recovery-actions`.
+- `POST /api/heartbeat-runs/{runId}/workspace/export-commits`.
 
 Agent access: `available` — REST / native call_api / CLI run, plus the listed
 read-only paths through the default queue and HTTP/2 sandbox callback bridge.
@@ -241,6 +242,17 @@ controller fixtures cover permitted reads, denied writes, redaction and private
 task-link filtering. After deployment, verify with an actual run identity and
 assert foreign-company, private-task and restricted-mode denial. Source review,
 board reads and skipped fixtures do not qualify that live path.
+
+Commit export: the running run's own agent (REST / native `call_api`; not on the
+sandbox callback bridge) or a board user with write access to the run's company
+can put the run workspace's current `HEAD` commit under
+`refs/paperclip/runs/{runId}/head` in the host repository. Another agent of the
+same company gets 403 `not_run_agent`; a run that is not running gets 409. The
+export reaches only a workspace the executing server process holds: the host
+worktree, or a native sandbox workspace sync. Evidence: `source-only`, in the
+[route](../../server/src/routes/run-commit-export.ts) and its
+[route suite](../../server/src/__tests__/run-commit-export-routes.test.ts);
+no live sandboxed run has called it.
 
 Gaps: Provider trace reveals/downloads require instance-admin and cannot be counted as
 ordinary run output access.
