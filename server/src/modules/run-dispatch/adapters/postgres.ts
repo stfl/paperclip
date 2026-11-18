@@ -2,7 +2,7 @@ import { hasConversationContinuationPolicy } from "../../../services/conversatio
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { validateReconstructedWorkspaceDispatch } from "../../../services/native-runtime/native-workspace-reconstruction.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
-import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, gte, inArray, isNotNull, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -13,6 +13,7 @@ import {
   heartbeatRuns,
   issueRecoveryActions,
   issueComments,
+  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
   projects,
@@ -133,6 +134,66 @@ async function readNativeReviewParticipantFacts(db: Db, input: {
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+// How many cards agents may address to other agents on one issue, between
+// two human turns on it, before a card's wake no longer gives a non-holder
+// a run. Far above a real exchange of questions; it ends two agents trading
+// cards with no human in the loop.
+const AGENT_CARD_WAKES_PER_HUMAN_TURN = 10;
+
+// Agent-created cards addressed to an agent on the issue, created after its
+// latest human turn (a board comment or a board-created card): the card
+// `interactionId` and those created before it.
+async function countAgentCardsSinceHumanTurn(
+  db: Db,
+  input: { companyId: string; issueId: string; interactionId: string },
+) {
+  const [humanComment] = await db
+    .select({ at: sql<Date | null>`max(${issueComments.createdAt})` })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.companyId, input.companyId),
+        eq(issueComments.issueId, input.issueId),
+        isNotNull(issueComments.authorUserId),
+        isNull(issueComments.authorAgentId),
+        isNull(issueComments.derivedAuthorAgentId),
+      ),
+    );
+  const [humanCard] = await db
+    .select({ at: sql<Date | null>`max(${issueThreadInteractions.createdAt})` })
+    .from(issueThreadInteractions)
+    .where(
+      and(
+        eq(issueThreadInteractions.companyId, input.companyId),
+        eq(issueThreadInteractions.issueId, input.issueId),
+        isNull(issueThreadInteractions.createdByAgentId),
+      ),
+    );
+  const since = [humanComment?.at, humanCard?.at]
+    .filter((at): at is Date => at != null)
+    .map((at) => new Date(at))
+    .reduce<Date | null>((latest, at) => (!latest || at > latest ? at : latest), null);
+  const [row] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(issueThreadInteractions)
+    .where(
+      and(
+        eq(issueThreadInteractions.companyId, input.companyId),
+        eq(issueThreadInteractions.issueId, input.issueId),
+        isNotNull(issueThreadInteractions.createdByAgentId),
+        isNotNull(issueThreadInteractions.addresseeAgentId),
+        // Compared in SQL: created_at keeps microseconds, which a JS Date
+        // read back from it drops.
+        or(
+          eq(issueThreadInteractions.id, input.interactionId),
+          sql`${issueThreadInteractions.createdAt} < (select card.created_at from issue_thread_interactions card where card.id = ${input.interactionId})`,
+        ),
+        ...(since ? [gt(issueThreadInteractions.createdAt, since)] : []),
+      ),
+    );
+  return row?.n ?? 0;
 }
 
 function classifyRetryReasonKind(retryReason: string | null): RetryReasonKind {
@@ -558,6 +619,43 @@ export function createPostgresRunDispatchAdapter(
     );
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
+    // A card addressed to an agent wakes that agent whether or not it holds
+    // the issue. While the card is pending on this issue, its addressee's run
+    // passes ownership as a comment wake does: it may answer on the issue and
+    // takes nothing over.
+    const interactionId = readNonEmptyString(context.interactionId);
+    const addresseeCard =
+      !isInteractionWake && issue && wakeReason === "interaction_pending" && interactionId &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(interactionId)
+        ? await dbOrTx
+            .select({ createdByAgentId: issueThreadInteractions.createdByAgentId })
+            .from(issueThreadInteractions)
+            .where(
+              and(
+                eq(issueThreadInteractions.id, interactionId),
+                eq(issueThreadInteractions.companyId, input.companyId),
+                eq(issueThreadInteractions.issueId, issue.id),
+                eq(issueThreadInteractions.addresseeAgentId, input.agentId),
+                // A card an agent addresses to itself is a note, no question
+                // to another agent: it gives the agent no run on the issue.
+                or(
+                  isNull(issueThreadInteractions.createdByAgentId),
+                  ne(issueThreadInteractions.createdByAgentId, input.agentId),
+                ),
+                eq(issueThreadInteractions.status, "pending"),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null)
+        : null;
+    const isAddresseeInteractionWake =
+      addresseeCard !== null &&
+      (addresseeCard.createdByAgentId === null ||
+        (await countAgentCardsSinceHumanTurn(dbOrTx, {
+          companyId: input.companyId,
+          issueId: issue!.id,
+          interactionId: interactionId!,
+        })) <= AGENT_CARD_WAKES_PER_HUMAN_TURN);
     const retryReason =
       readNonEmptyString(context.retryReason) ?? input.scheduledRetryReason ?? null;
     const interactionResolvedAt = readNonEmptyString(context.interactionResolvedAt);
@@ -631,7 +729,7 @@ export function createPostgresRunDispatchAdapter(
       isResolvedInteractionContinuation,
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
-      isInteractionWake,
+      isInteractionWake: isInteractionWake || isAddresseeInteractionWake,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
