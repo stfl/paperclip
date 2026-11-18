@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { createSystemRecovery, failSystemRecovery, readSystemRecovery, reserveSystemRecoveryAttempt, SYSTEM_RECOVERY_WINDOW_MS, SystemRecoveryFailure } from "./system-recovery-state.js";
+import { createSystemRecovery, failSystemRecovery, readSystemRecovery, reserveSystemRecoveryAttempt, SYSTEM_RECOVERY_MAX_RETRIES, SYSTEM_RECOVERY_WINDOW_MS, SystemRecoveryFailure, WORKSPACE_WRITER_RECHECK_MS } from "./system-recovery-state.js";
 
 describe("durable system recovery budget", () => {
   it("makes six attempts with exponential delays that survive serialization and exhaustion", () => {
@@ -67,6 +67,44 @@ describe("durable system recovery budget", () => {
     expect(state.retriesUsed).toBe(1);
     state = failSystemRecovery(state, new SystemRecoveryFailure("provider_unavailable", "retry_transient"), { now: state.nextAttemptAt ?? now });
     expect(state.state).toBe("scheduled");
+  });
+  describe("a wait for another run after the retry budget is spent", () => {
+    const writer = new SystemRecoveryFailure("workspace_writer_active", "recheck_evidence");
+    const other = new SystemRecoveryFailure("provider_unavailable", "retry_transient");
+    function spentThenWaiting() {
+      let state = createSystemRecovery(randomUUID());
+      let now = 0;
+      state = reserveSystemRecoveryAttempt(state, now)!;
+      for (let i = 0; i < SYSTEM_RECOVERY_MAX_RETRIES - 1; i++) {
+        state = failSystemRecovery(state, other, { now });
+        now = state.nextAttemptAt!;
+        state = reserveSystemRecoveryAttempt(state, now)!;
+      }
+      expect(state.retriesUsed).toBe(SYSTEM_RECOVERY_MAX_RETRIES);
+      state = failSystemRecovery(state, writer, { now });
+      return { state, now };
+    }
+    it("reserves the next attempt without spending a retry", () => {
+      const { state, now } = spentThenWaiting();
+      expect(state).toMatchObject({ state: "awaiting_evidence", deadlineAt: null });
+      expect(reserveSystemRecoveryAttempt(state, now)).toBeNull();
+      const next = reserveSystemRecoveryAttempt(state, now + WORKSPACE_WRITER_RECHECK_MS);
+      expect(next).not.toBeNull();
+      expect(next!.retriesUsed).toBe(SYSTEM_RECOVERY_MAX_RETRIES);
+    });
+    it("ends exhausted when that attempt fails with another code", () => {
+      const { state, now } = spentThenWaiting();
+      const at = now + WORKSPACE_WRITER_RECHECK_MS;
+      const failed = failSystemRecovery(reserveSystemRecoveryAttempt(state, at)!, other, { now: at });
+      expect(failed.state).toBe("exhausted");
+    });
+    it("waits again when that attempt fails with the writer code again", () => {
+      const { state, now } = spentThenWaiting();
+      const at = now + WORKSPACE_WRITER_RECHECK_MS;
+      const waiting = failSystemRecovery(reserveSystemRecoveryAttempt(state, at)!, writer, { now: at });
+      expect(waiting).toMatchObject({ state: "awaiting_evidence", deadlineAt: null, retriesUsed: SYSTEM_RECOVERY_MAX_RETRIES });
+      expect(reserveSystemRecoveryAttempt(waiting, at + WORKSPACE_WRITER_RECHECK_MS)).not.toBeNull();
+    });
   });
   it("reads prior incident metadata without losing the local recovery budget or failure", () => {
     const state = failSystemRecovery(createSystemRecovery(randomUUID()),
