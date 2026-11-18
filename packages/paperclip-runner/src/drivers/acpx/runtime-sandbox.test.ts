@@ -137,6 +137,17 @@ describe("ACPX runtime sandbox", () => {
     },
   );
 
+  it("keeps the managed GitHub broker environment in the Claude launch", async () => {
+    const fixture = await sandboxFixture("claude");
+    const github = {
+      PATH: "/run/github/launcher:/bin", BASH_ENV: "/run/github/bash-env", ZDOTDIR: "/run/github/zdotdir",
+      PAPERCLIP_GITHUB_LAUNCHER_DIR: "/run/github/launcher", PAPERCLIP_GITHUB_BROKER_TOKEN: "broker-capability", GH_TOKEN: "",
+    };
+    const sandbox = await prepareAcpxRuntimeSandbox({ binding: fixture.binding, agent: "claude", environment: github });
+    expect(sandbox.launchEnvironment).toMatchObject(github);
+    expect(sandbox.persistedEnvironment).not.toHaveProperty("PAPERCLIP_GITHUB_BROKER_TOKEN");
+  });
+
   it("pins Claude's exact model in isolated settings on open and recovery", async () => {
     const fixture = await sandboxFixture("claude");
     for (const model of ["claude-sonnet-5", "custom-claude-model"]) {
