@@ -304,6 +304,12 @@ impl AcpxSidecarTransport {
                 "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
             ]);
         }
+        // The launcher directory marks a managed run, whose GitHub keys carry
+        // the run's broker capability to the shell. Without it the same keys
+        // in this process are ambient login state.
+        if std::env::var_os("PAPERCLIP_GITHUB_LAUNCHER_DIR").is_some_and(|dir| !dir.is_empty()) {
+            keys.extend_from_slice(crate::codex_provider::GITHUB_CREDENTIAL_ENVIRONMENT_KEYS);
+        }
         let pi_keys = if agent == "pi" {
             pi_credential_environment_keys(
                 std::env::var("PAPERCLIP_ACPX_CREDENTIAL_BINDING")
