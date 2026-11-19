@@ -6,6 +6,9 @@ import { ENVIRONMENT_LEASE_POLICIES, WORKSPACE_SOURCE_VERIFICATION_REASONS,
 export const SYSTEM_RECOVERY_POLICY_VERSION = 1;
 export const SYSTEM_RECOVERY_MAX_RETRIES = 5;
 export const SYSTEM_RECOVERY_WINDOW_MS = 30 * 60_000;
+/** Matches the periodic recovery sweep, so a source whose only obstacle was
+ * another run on its task is recovered on the sweep after that run ends. */
+export const WORKSPACE_WRITER_RECHECK_MS = 30_000;
 export function infrastructureRetryDelayMs(retryNumber: number, sample: number) {
   return Math.round(30_000 * 2 ** (retryNumber - 1) * (0.8 + Math.min(1, Math.max(0, sample)) * 0.4));
 }
@@ -97,7 +100,8 @@ export function reserveSystemRecoveryAttempt(state: SystemRecoveryState, now = D
   if ((state.deadlineAt !== null && now >= state.deadlineAt) ||
       (state.attempts > 0 && state.retriesUsed >= SYSTEM_RECOVERY_MAX_RETRIES)) return null;
   return { ...state, revision: state.revision + 1, state: "running", attemptId: randomUUID(),
-    attempts: state.attempts + 1, retriesUsed: state.retriesUsed + (state.attempts > 0 ? 1 : 0), nextAttemptAt: null };
+    attempts: state.attempts + 1, nextAttemptAt: null,
+    retriesUsed: state.retriesUsed + (state.attempts > 0 && state.failure?.code !== "workspace_writer_active" ? 1 : 0) };
 }
 
 /** The caller persists this timestamp. A restart must not recalculate jitter. */
@@ -106,6 +110,12 @@ export function failSystemRecovery(
   options: { now?: number; retryAfterAt?: number; evidenceFingerprint?: string; cause?: RecoveryFailureCause } = {},
 ): SystemRecoveryState {
   const now = options.now ?? Date.now();
+  // Another run on the task can outlast the whole retry window. Waiting for it
+  // spends neither a retry nor window time, so it never exhausts the source.
+  if (failure.code === "workspace_writer_active") return { ...state, revision: state.revision + 1,
+    firstFailureAt: null, deadlineAt: null, state: "awaiting_evidence", nextAttemptAt: now + WORKSPACE_WRITER_RECHECK_MS,
+    failure: { code: failure.code, retryClass: failure.retryClass,
+      evidenceFingerprint: options.evidenceFingerprint ?? createHash("sha256").update(`${state.sourceRunId}:${failure.code}`).digest("hex") } };
   const firstFailureAt = state.firstFailureAt ?? now;
   const deadlineAt = state.deadlineAt ?? firstFailureAt + SYSTEM_RECOVERY_WINDOW_MS;
   const retryNumber = state.retriesUsed + 1;
