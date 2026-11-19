@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { recordedProcessIsGone, signalProbeProvesGone } from "./recorded-process-probe.js";
+import { recordedGroupStartedAt, recordedProcessIsGone, signalProbeProvesGone } from "./recorded-process-probe.js";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -69,5 +69,10 @@ describe("stop proof for a recorded process identifier", () => {
     expect(await recordedProcessIsGone(process.pid, null)).toBe(false);
     expect(await recordedProcessIsGone(process.pid, new Date(0))).toBe(true);
     expect(await recordedProcessIsGone(2_000_000_101, recorded)).toBe(true);
+  });
+
+  it("identifies a group by the recorded start time only when the process leads it", () => {
+    expect(recordedGroupStartedAt({ processPid: 4242, processGroupId: 4242, processStartedAt: recorded })).toBe(recorded);
+    expect(recordedGroupStartedAt({ processPid: 4243, processGroupId: 4242, processStartedAt: recorded })).toBeNull();
   });
 });

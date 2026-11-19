@@ -292,10 +292,10 @@ periodic agent heartbeats to be enabled.
 A cancelled run record does not prove that execution stopped.
 The host also checks process ownership, controller leases, and environment cleanup.
 Required plugin cleanup cannot start while these checks are incomplete.
-The controller of a finalization is the server's own process. When the host
-is not permitted to signal a recorded controller process identifier, the
-process start time decides. The recorded start time means the controller is
-alive. Another start time, or a process that the host cannot see, means the
+The host starts every run process and every finalization controller as its
+own user. When the host is not permitted to signal a recorded process
+identifier of a finished run or of a finalization controller, the process
+start time decides. The recorded start time means the process is alive. Another start time, or a process that the host cannot see, means the
 identifier belongs to an unrelated process. A visible process with no
 recorded start time to compare keeps the check waiting. Windows is the
 exception: there a denied probe proves nothing and the check keeps waiting.

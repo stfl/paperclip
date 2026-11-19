@@ -48,7 +48,7 @@ const support = await getEmbeddedPostgresTestSupport();
     return run!;
   }
   /** Answers signal-0 probes for the listed identifiers; every other call reaches the OS. */
-  function probe(answers: Record<number, "ESRCH" | "EPERM" | "alive">) {
+  function probe(answers: Record<number, "ESRCH" | "EPERM" | "EINVAL" | "alive">) {
     const kill = process.kill.bind(process);
     return vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {
       const answer = signal === 0 ? answers[pid] : undefined;
@@ -64,6 +64,54 @@ const support = await getEmbeddedPostgresTestSupport();
       runtimeMode: "legacy", startedAt: at, finishedAt: at, processPid: process.pid, ...values }).returning();
     return run!;
   }
+
+  /** A finished legacy run of this host, as an agent keeps from before it moved to a provider environment. */
+  const legacyRun = (agentId: string, values: Partial<typeof heartbeatRuns.$inferInsert> = {}) => finishedRun(agentId, {
+    processPid: RECORDED_PID, processGroupId: RECORDED_PID, processStartedAt: new Date("2026-01-01T00:00:00.000Z"), ...values });
+
+  it("does not hold on an earlier legacy run whose pid and group now belong to another user's process", async () => {
+    const agent = await hire();
+    const run = await legacyRun(agent.id);
+    const kill = probe({ [RECORDED_PID]: "EPERM", [-RECORDED_PID]: "EPERM" });
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+    expect(kill).toHaveBeenCalledWith(RECORDED_PID, 0);
+    expect(kill).toHaveBeenCalledWith(-RECORDED_PID, 0);
+    // The run keeps its identity as stop evidence.
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0])
+      .toMatchObject({ processPid: RECORDED_PID, processGroupId: RECORDED_PID });
+  });
+
+  it("does not hold on an earlier legacy run whose process no longer exists", async () => {
+    const agent = await hire();
+    await legacyRun(agent.id);
+    probe({ [RECORDED_PID]: "ESRCH", [-RECORDED_PID]: "ESRCH" });
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+  });
+
+  it("holds while the server can signal the recorded process or its group, and on a failure that proves nothing", async () => {
+    const agent = await hire();
+    const run = await legacyRun(agent.id);
+    probe({ [RECORDED_PID]: "EPERM", [-RECORDED_PID]: "alive" });
+    expect(await agentExecutionStopHold(db, [agent.id])).toMatchObject({ clause: "process_alive", runId: run.id });
+    vi.restoreAllMocks();
+    probe({ [RECORDED_PID]: "EINVAL", [-RECORDED_PID]: "ESRCH" });
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(false);
+  });
+
+  it.skipIf(process.platform !== "linux")("holds on a process the server may not signal while it has the recorded start time", async () => {
+    const agent = await hire();
+    const startedAt = new Date((await readProcessStartedAt(process.pid))!);
+    const run = await legacyRun(agent.id, { processPid: process.pid, processGroupId: process.pid, processStartedAt: startedAt });
+    probe({ [process.pid]: "EPERM", [-process.pid]: "EPERM" });
+    expect(await agentExecutionStopHold(db, [agent.id])).toMatchObject({ clause: "process_alive", runId: run.id });
+    // Another start time says the number was reused.
+    await db.update(heartbeatRuns).set({ processStartedAt: new Date(0) }).where(eq(heartbeatRuns.id, run.id));
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+    // A group that the recorded process does not lead has no recorded start time to compare.
+    await db.update(heartbeatRuns).set({ processPid: RECORDED_PID }).where(eq(heartbeatRuns.id, run.id));
+    probe({ [RECORDED_PID]: "ESRCH", [-process.pid]: "EPERM" });
+    expect(await agentExecutionStopHold(db, [agent.id])).toMatchObject({ clause: "process_alive", runId: run.id });
+  });
 
   it("logs a hold when it starts, when its cause changes, and then only at a slow interval", async () => {
     const agent = await hire();

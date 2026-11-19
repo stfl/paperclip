@@ -5,7 +5,7 @@ import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } fro
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
-import { recordedProcessIsGone } from "./recorded-process-probe.js";
+import { recordedGroupStartedAt, recordedProcessIsGone } from "./recorded-process-probe.js";
 import { logger } from "../middleware/logger.js";
 
 /** Each key names one check that an agent's executions have stopped. It is a
@@ -80,10 +80,6 @@ async function findStopHold(db: Db, agentIds: string[]): Promise<AgentExecutionS
   const ownedFinalization = abandoned.find(row => !row.leaseExpiresAt || row.leaseExpiresAt > now || row.resultId ||
       runs.find(run => run.id === row.runId)?.status !== "cancelled");
   if (ownedFinalization) return { clause: "finalization_owner_active", runId: ownedFinalization.runId, agentId: runAgent(ownedFinalization.runId) };
-  const absent = (pid: number) => {
-    try { process.kill(pid, 0); return false; }
-    catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
-  };
   for (const coordinator of abandoned) {
     if (!coordinator.controllerPid ||
         await recordedProcessIsGone(coordinator.controllerPid, coordinator.controllerProcessStartedAt)) continue;
@@ -102,8 +98,12 @@ async function findStopHold(db: Db, agentIds: string[]): Promise<AgentExecutionS
       if (run.status === "cancelled" && !runLeases.every(hasRemoteTerminationReceipt)) return hold("remote_stop_unconfirmed");
       continue;
     }
-    let processAlive = Boolean(run.processPid && !absent(run.processPid));
-    let groupAlive = Boolean(run.processGroupId && !absent(-run.processGroupId));
+    // A run of this host, such as an earlier legacy run of an agent that now runs
+    // in a provider environment: the OS may have given its numbers to another
+    // user's process since.
+    let processAlive = Boolean(run.processPid && !await recordedProcessIsGone(run.processPid, run.processStartedAt));
+    let groupAlive = Boolean(run.processGroupId &&
+      !await recordedProcessIsGone(-run.processGroupId, recordedGroupStartedAt(run)));
     if (processAlive && run.processStartedAt) {
       const observed = await readProcessStartedAt(run.processPid!).catch(() => null);
       if (observed && new Date(observed).getTime() !== run.processStartedAt.getTime()) {

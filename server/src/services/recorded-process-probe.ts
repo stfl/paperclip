@@ -47,6 +47,14 @@ export async function signalProbeProvesGone(
     Math.abs(observedAt - recordedStartedAt!.getTime()) >= SAME_START_TOLERANCE_MS;
 }
 
+/** A run records the start time of its process. That time identifies the
+ * process group as well only when the process leads the group. */
+export function recordedGroupStartedAt(identity: {
+  processPid: number | null; processGroupId: number | null; processStartedAt: Date | null;
+}): Date | null {
+  return identity.processGroupId === identity.processPid ? identity.processStartedAt : null;
+}
+
 /** Signal 0 only probes. */
 export async function recordedProcessIsGone(
   pid: number,
