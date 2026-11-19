@@ -327,8 +327,6 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     }, { url: `http://127.0.0.1:${address.port}`, token: "run-capability" }), PATH: `${bin}:${realBin}:${process.env.PATH}` };
     const git = async (...args: string[]) => (await exec(path.join(bin, "git"), args, { cwd: repo, env })).stdout.trim();
     await git("init");
-    await git("config", "user.name", "Repository Author");
-    await git("config", "user.email", "repository@example.test");
     await git("commit", "--allow-empty", "-m", "A");
     user = "B";
     await git("commit", "--allow-empty", "-m", "B");
@@ -351,6 +349,8 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     expect(operationB.token).toBe("credential-B");
     expect(completedA.config).not.toBe(operationB.config);
     user = null;
+    await git("config", "user.name", "Repository Author");
+    await git("config", "user.email", "repository@example.test");
     await git("commit", "--allow-empty", "-m", "Local identity");
     expect(await git("log", "-1", "--format=%an <%ae>|%cn <%ce>"))
       .toBe("Repository Author <repository@example.test>|Repository Author <repository@example.test>");
@@ -411,6 +411,69 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     expect((await git("-C", "repo", "commit", "--allow-empty", "-m", "Managed work")).posts).toBe(1);
     expect((await git("-C", "repo", "log", "-1", "--format=%an <%ae>")).stdout).toBe("Managed <managed@example.test>");
   }, 20_000);
+
+  it("lets repository configuration choose the git commit identity and keeps the connection's elsewhere", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-repository-identity-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), realBin = path.join(root, "real");
+    const owned = path.join(root, "owned"), included = path.join(root, "included"), plain = path.join(root, "plain");
+    const emailOnly = path.join(root, "email-only");
+    const connectionName = 'Connection "Bot" \\ Team';
+    for (const dir of [bin, realBin, owned, included, plain, emailOnly]) await mkdir(dir);
+    for (const name of ["git", "gh"]) await writeFile(path.join(bin, name), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(realBin, "gh"), `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ author: process.env.GIT_AUTHOR_NAME, count: process.env.GIT_CONFIG_COUNT, global: process.env.GIT_CONFIG_GLOBAL }));
+`, { mode: 0o700 });
+    for (const repo of [owned, included, plain, emailOnly]) await exec("git", ["init", repo]);
+    await exec("git", ["-C", emailOnly, "config", "user.email", "email-only@example.test"]);
+    await exec("git", ["-C", owned, "config", "user.name", "Repository Author"]);
+    await exec("git", ["-C", owned, "config", "user.email", "repository@example.test"]);
+    await writeFile(path.join(root, "identity.gitconfig"), "[user]\n\tname = Included Author\n\temail = included@example.test\n");
+    await exec("git", ["-C", included, "config", "include.path", path.join(root, "identity.gitconfig")]);
+    const server = createServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: {
+        GH_TOKEN: "managed-token", PAPERCLIP_GIT_TOKEN: "managed-token",
+        GIT_AUTHOR_NAME: connectionName, GIT_AUTHOR_EMAIL: "connection@example.test",
+        GIT_COMMITTER_NAME: connectionName, GIT_COMMITTER_EMAIL: "connection@example.test",
+        GIT_CONFIG_COUNT: "6",
+        GIT_CONFIG_KEY_0: "credential.helper", GIT_CONFIG_VALUE_0: "",
+        GIT_CONFIG_KEY_1: "credential.https://github.com.helper", GIT_CONFIG_VALUE_1: "!paperclip-credential-helper",
+        GIT_CONFIG_KEY_2: "url.https://github.com/.insteadOf", GIT_CONFIG_VALUE_2: "git@github.com:",
+        GIT_CONFIG_KEY_3: "url.https://github.com/.insteadOf", GIT_CONFIG_VALUE_3: "ssh://git@github.com/",
+        GIT_CONFIG_KEY_4: "user.name", GIT_CONFIG_VALUE_4: connectionName,
+        GIT_CONFIG_KEY_5: "user.email", GIT_CONFIG_VALUE_5: "connection@example.test",
+      } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "run-capability" }),
+      PATH: `${bin}:${realBin}:${process.env.PATH}` };
+    const run = async (name: string, cwd: string, ...args: string[]) => (await exec(path.join(bin, name), args, { cwd, env })).stdout.trim();
+    const author = (cwd: string) => run("git", cwd, "log", "-1", "--format=%an <%ae>|%cn <%ce>");
+    const repository = "Repository Author <repository@example.test>|Repository Author <repository@example.test>";
+    const connection = `${connectionName} <connection@example.test>|${connectionName} <connection@example.test>`;
+
+    await run("git", owned, "commit", "--allow-empty", "-m", "Repository work");
+    expect(await author(owned)).toBe(repository);
+    await run("git", root, "-C", owned, "commit", "--allow-empty", "-m", "Repository work from elsewhere");
+    expect(await author(owned)).toBe(repository);
+    await run("git", included, "commit", "--allow-empty", "-m", "Included work");
+    expect(await author(included)).toBe("Included Author <included@example.test>|Included Author <included@example.test>");
+    await run("git", plain, "commit", "--allow-empty", "-m", "Connection work");
+    expect(await author(plain)).toBe(connection);
+    await run("git", emailOnly, "commit", "--allow-empty", "-m", "Email-only work");
+    expect(await author(emailOnly)).toBe(`${connectionName} <email-only@example.test>|${connectionName} <email-only@example.test>`);
+    await run("git", owned, "-c", `alias.nested=!git -C '${plain}' commit --allow-empty -m Nested`, "nested");
+    expect(await author(plain)).toBe(connection);
+
+    // `git config` is a local command and never asks the broker, so a command the launcher treats as remote reads the configuration.
+    expect(await run("git", owned, "-c", "alias.insteadof=!git config --get-all url.https://github.com/.insteadOf", "insteadof")).toBe("git@github.com:\nssh://git@github.com/");
+    expect(await run("git", owned, "-c", "alias.helper=!git config credential.https://github.com.helper", "helper")).toBe("!paperclip-credential-helper");
+    expect(await run("git", owned, "-c", "alias.token=!printf %s \"$PAPERCLIP_GIT_TOKEN\"", "token")).toBe("managed-token");
+    expect(JSON.parse(await run("gh", owned))).toEqual({ author: connectionName, count: "6", global: expect.stringMatching(/paperclip-github-operation-[^/]+\/gitconfig$/) });
+  });
 });
 
 it("captures the current task broker file once per invocation and never falls back to inherited authority", async () => {
