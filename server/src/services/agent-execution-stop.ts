@@ -5,6 +5,7 @@ import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } fro
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
+import { recordedProcessIsGone } from "./recorded-process-probe.js";
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
@@ -27,7 +28,8 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
     catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
   };
   for (const coordinator of abandoned) {
-    if (!coordinator.controllerPid || absent(coordinator.controllerPid)) continue;
+    if (!coordinator.controllerPid ||
+        await recordedProcessIsGone(coordinator.controllerPid, coordinator.controllerProcessStartedAt)) continue;
     const observed = await readProcessStartedAt(coordinator.controllerPid).catch(() => null);
     if (!observed || !coordinator.controllerProcessStartedAt ||
         new Date(observed).getTime() === coordinator.controllerProcessStartedAt.getTime()) return false;
