@@ -652,9 +652,13 @@ export interface PreparedSandboxManagedRuntime {
    * index or file and no state `restoreWorkspace` reads, so it is safe while
    * the agent runs and before the final restore.
    */
-  exportWorkspaceGitHead(input: { localRef: string }): Promise<WorkspaceGitHeadExport>;
+  exportWorkspaceGitHead(input: { localRef: string; maxBundleBytes?: number }): Promise<WorkspaceGitHeadExport>;
   restoreWorkspace(onProgress?: RuntimeProgressSink): Promise<void>;
 }
+
+/** Bounds what one export adds to the host's shared object store. */
+export const WORKSPACE_GIT_HEAD_EXPORT_MAX_BUNDLE_BYTES = 256 * 1024 * 1024;
+export const WORKSPACE_GIT_BUNDLE_TOO_LARGE = "workspace_git_bundle_too_large";
 
 export interface WorkspaceGitHeadExport {
   commitSha: string;
@@ -2018,10 +2022,11 @@ export async function prepareSandboxManagedRuntime(input: {
         ? { baseline: baselineSnapshot, gitSnapshot, ...(!gitSnapshot && repositories.length ? { repositories } : {}) }
         : null,
     cleanupWorkspaceSnapshot,
-    exportWorkspaceGitHead: async ({ localRef }) => {
+    exportWorkspaceGitHead: async ({ localRef, maxBundleBytes = WORKSPACE_GIT_HEAD_EXPORT_MAX_BUNDLE_BYTES }) => {
       if (!syncWorkspace || !gitSnapshot) throw new Error("workspace_git_unavailable");
       return withTempDir("paperclip-sandbox-head-export-", async (tempDir) => {
         const exportId = randomUUID();
+        const importedRef = createImportedGitRef("sandbox-head");
         const remoteBundle = path.posix.join(runtimeRootDir, `head-export-${exportId}.bundle`);
         const remoteHeadInfo = path.posix.join(runtimeRootDir, `head-export-${exportId}.txt`);
         const exportRef = createRemoteGitExportRef("sandbox-head");
@@ -2039,9 +2044,17 @@ export async function prepareSandboxManagedRuntime(input: {
               }))}`,
               { timeoutMs: input.spec.timeoutMs },
             );
-            const [commitSha = "", branch = ""] = toBuffer(await input.client.readFile(remoteHeadInfo))
+            const [commitSha = "", branch = "", reportedBytes = ""] = toBuffer(await input.client.readFile(remoteHeadInfo))
               .toString("utf8").split("\n").map((line) => line.trim());
-            if (!/^[0-9a-f]{40}$/.test(commitSha)) throw new Error("workspace_git_head_unreadable");
+            if (!/^[0-9a-f]{40}$/.test(commitSha) || !/^[0-9]+$/.test(reportedBytes)) {
+              throw new Error("workspace_git_head_unreadable");
+            }
+            // The target reports the size before the transfer; the received
+            // size is checked again because the target is not trusted.
+            const assertWithinLimit = (bytes: number) => {
+              if (bytes > maxBundleBytes) throw new Error(WORKSPACE_GIT_BUNDLE_TOO_LARGE);
+            };
+            assertWithinLimit(Number(reportedBytes));
             if (nativeSyncOut) {
               const operations: SandboxSyncOperation[] = [{
                 operationId: nextSyncOperationId(),
@@ -2050,9 +2063,13 @@ export async function prepareSandboxManagedRuntime(input: {
               assertSyncOperationsConfined(operations, { sourceRoots: [runtimeRootDir], targetRoots: [tempDir] });
               await input.client.syncOut!(operations);
             } else {
-              await fs.writeFile(localBundlePath, toBuffer(await input.client.readFile(remoteBundle)));
+              const bundle = toBuffer(await input.client.readFile(remoteBundle));
+              assertWithinLimit(bundle.byteLength);
+              await fs.writeFile(localBundlePath, bundle);
             }
-            if ((await fs.stat(localBundlePath)).size === 0) {
+            const receivedBytes = (await fs.stat(localBundlePath)).size;
+            assertWithinLimit(receivedBytes);
+            if (receivedBytes === 0) {
               // The target claims the host already holds this commit; a host
               // that does not gets a self-contained bundle on the retry.
               const held = await runLocalGit(input.workspaceLocalDir, ["cat-file", "-e", `${commitSha}^{commit}`], {
@@ -2060,22 +2077,25 @@ export async function prepareSandboxManagedRuntime(input: {
                 maxBuffer: 16 * 1024,
               }).then(() => true, () => false);
               if (!held) throw new Error(`lacks these prerequisite commits: ${commitSha}`);
-              await runLocalGit(input.workspaceLocalDir, ["update-ref", localRef, commitSha], {
-                timeout: 10_000,
-                maxBuffer: 16 * 1024,
-              });
             } else {
               const imported = await fetchGitBundleIntoLocalRef({
                 localDir: input.workspaceLocalDir,
                 bundlePath: localBundlePath,
                 exportRef,
-                importedRef: localRef,
+                importedRef,
                 baseSha: commitSha,
               });
               if (imported !== commitSha) throw new Error("workspace_git_head_import_mismatch");
             }
+            // `localRef` moves only to a verified commit, so a failed export
+            // leaves the previous export's ref as it was.
+            await runLocalGit(input.workspaceLocalDir, ["update-ref", localRef, commitSha], {
+              timeout: 10_000,
+              maxBuffer: 16 * 1024,
+            });
             return { commitSha, branch: branch || null };
           } finally {
+            await deleteLocalGitRef({ localDir: input.workspaceLocalDir, ref: importedRef });
             await input.client.remove(remoteBundle).catch(() => undefined);
             await input.client.remove(remoteHeadInfo).catch(() => undefined);
             await fs.rm(localBundlePath, { force: true }).catch(() => undefined);

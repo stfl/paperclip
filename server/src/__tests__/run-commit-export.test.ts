@@ -28,7 +28,7 @@ const runner: CommandManagedRuntimeRunner = {
       timeout: input.timeoutMs, maxBuffer: 16 * 1024 * 1024,
     }, (error, stdout, stderr) => resolve({
       exitCode: error ? (typeof error.code === "number" ? error.code : 1) : 0,
-      signal: error?.signal ?? null, timedOut: error?.killed ?? false, stdout, stderr,
+      signal: error?.signal ?? null, timedOut: error?.killed ?? false, stdout, stderr, pid: null, startedAt: null,
     }));
     child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
       if (error.code !== "EPIPE") reject(error);
@@ -74,7 +74,8 @@ describe("run commit export", () => {
     return { root, host };
   }
 
-  async function sandboxRun(root: string, host: string, runId = randomUUID()) {
+  async function sandboxRun(root: string, host: string, options: { commitExportCloseTimeoutMs?: number } = {}) {
+    const runId = randomUUID();
     const remote = path.join(root, `remote-${runId}`);
     const lease = { id: "lease", providerLeaseId: "sandbox", metadata: {} } as EnvironmentLease;
     let runnerProfileJson: Record<string, unknown> = {};
@@ -103,10 +104,10 @@ describe("run commit export", () => {
     };
     const sync = (await prepareNativeWorkspaceSync({
       db: db as unknown as Db, runId, companyId: "company", workspaceId: "workspace",
-      workspaceLocalDir: host, lease, target,
+      workspaceLocalDir: host, lease, target, ...options,
     }))!;
     const release = registerRunCommitExport(runId, runCommitExporterFor({
-      executionTarget: target, nativeWorkspaceSync: sync, hostWorkspaceDir: host,
+      runId, executionTarget: target, nativeWorkspaceSync: sync, hostWorkspaceDir: host,
     }));
     releases.push(release);
     return { runId, remote, sync, release, ref: runCommitExportRef(runId) };
@@ -179,10 +180,60 @@ describe("run commit export", () => {
     expect(await readFile(path.join(host, "file.txt"), "utf8")).toBe("second\n");
     expect(await refExists(host, ref)).toBe(false);
 
-    expect(await exportRunCommits(runId)).toEqual({ commitSha: sandboxHead, branch: "work", ref });
-    await sync.cleanup();
-    await releases.pop()!();
+    await expect(exportRunCommits(runId)).rejects.toMatchObject({ code: "workspace_not_exportable" });
     expect(await refExists(host, ref)).toBe(false);
+  }, 30_000);
+
+  it.each(["restore", "cleanup"] as const)("leaves no ref when an export is in flight during %s", async (step) => {
+    const { root, host } = await hostRepository();
+    const { runId, remote, sync, ref } = await sandboxRun(root, host);
+    await git(remote, "commit", "--allow-empty", "-m", "sandbox commit");
+
+    const exported = exportRunCommits(runId);
+    await (step === "restore" ? sync.restoreWorkspace() : sync.cleanup());
+
+    await expect(exported).resolves.toMatchObject({ ref });
+    expect(await refExists(host, ref)).toBe(false);
+    await expect(exportRunCommits(runId)).rejects.toMatchObject({ code: "workspace_not_exportable" });
+  }, 30_000);
+
+  it("finalizes past a hung export and deletes its ref once it settles", async () => {
+    const { root, host } = await hostRepository();
+    const { runId, remote, sync, ref } = await sandboxRun(root, host, { commitExportCloseTimeoutMs: 50 });
+    let releaseExport!: () => void;
+    const exportHeld = new Promise<void>((resolve) => { releaseExport = resolve; });
+    const fetchBundle = gitWorkspaceSync.fetchGitBundleIntoLocalRef;
+    vi.spyOn(gitWorkspaceSync, "fetchGitBundleIntoLocalRef").mockImplementation(async (input) => {
+      if (input.importedRef.includes("sandbox-head")) await exportHeld;
+      return fetchBundle(input);
+    });
+    await git(remote, "commit", "--allow-empty", "-m", "sandbox commit");
+    const sandboxHead = await git(remote, "rev-parse", "HEAD");
+
+    const exported = exportRunCommits(runId);
+    await sync.restoreWorkspace();
+    expect(await git(host, "rev-parse", "HEAD")).toBe(sandboxHead);
+
+    releaseExport();
+    await exported;
+    await vi.waitFor(async () => expect(await refExists(host, ref)).toBe(false));
+  }, 30_000);
+
+  it("keeps the previous ref when an export fails and moves it on the next good one", async () => {
+    const { root, host } = await hostRepository();
+    const { runId, remote, ref } = await sandboxRun(root, host);
+    await git(remote, "commit", "--allow-empty", "-m", "first");
+    const first = await git(remote, "rev-parse", "HEAD");
+    await exportRunCommits(runId);
+    await git(remote, "commit", "--allow-empty", "-m", "second");
+    const second = await git(remote, "rev-parse", "HEAD");
+    vi.spyOn(gitWorkspaceSync, "fetchGitBundleIntoLocalRef").mockRejectedValueOnce(new Error("fatal: corrupt bundle"));
+
+    await expect(exportRunCommits(runId)).rejects.toMatchObject({ code: "export_failed", message: "fatal: corrupt bundle" });
+    expect(await git(host, "rev-parse", ref)).toBe(first);
+
+    expect(await exportRunCommits(runId)).toMatchObject({ commitSha: second });
+    expect(await git(host, "rev-parse", ref)).toBe(second);
   }, 30_000);
 
   it("deletes the ref with the run's sync state when no restore succeeded", async () => {
@@ -220,7 +271,7 @@ describe("run commit export", () => {
     const head = await git(host, "rev-parse", "HEAD");
     const runId = randomUUID();
     const release = registerRunCommitExport(runId, runCommitExporterFor({
-      executionTarget: null, nativeWorkspaceSync: null, hostWorkspaceDir: host,
+      runId, executionTarget: null, nativeWorkspaceSync: null, hostWorkspaceDir: host,
     }));
     const ref = runCommitExportRef(runId);
 
@@ -232,12 +283,32 @@ describe("run commit export", () => {
     await expect(exportRunCommits(runId)).rejects.toMatchObject({ code: "workspace_not_exportable" });
   });
 
+  it("removes a host-worktree ref a crashed process left behind when the next host exporter starts", async () => {
+    const { host } = await hostRepository();
+    const crashedRun = randomUUID();
+    // What a crashed process leaves: the ref and its marker, with no live exporter.
+    await git(host, "update-ref", runCommitExportRef(crashedRun), "HEAD");
+    const markers = path.join(process.env.PAPERCLIP_HOME!, "instances", "test", "run-commit-exports");
+    await mkdir(markers, { recursive: true });
+    await writeFile(path.join(markers, `${crashedRun}.json`), JSON.stringify({ localDir: host, ref: runCommitExportRef(crashedRun) }));
+
+    const nextRun = randomUUID();
+    releases.push(registerRunCommitExport(nextRun, runCommitExporterFor({
+      runId: nextRun, executionTarget: null, nativeWorkspaceSync: null, hostWorkspaceDir: host,
+    })));
+    await exportRunCommits(nextRun);
+
+    expect(await refExists(host, runCommitExportRef(crashedRun))).toBe(false);
+    await expect(stat(path.join(markers, `${crashedRun}.json`))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await refExists(host, runCommitExportRef(nextRun))).toBe(true);
+  });
+
   it("refuses with a reason code", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-run-commit-export-plain-"));
     roots.push(root);
     const plainRun = randomUUID();
     releases.push(registerRunCommitExport(plainRun, runCommitExporterFor({
-      executionTarget: { kind: "local" }, nativeWorkspaceSync: null, hostWorkspaceDir: root,
+      runId: plainRun, executionTarget: { kind: "local" }, nativeWorkspaceSync: null, hostWorkspaceDir: root,
     })));
     await expect(exportRunCommits(plainRun)).rejects.toMatchObject({ code: "no_git_workspace" });
 
@@ -249,7 +320,7 @@ describe("run commit export", () => {
     await expect(exportRunCommits(failingRun)).rejects.toMatchObject({ code: "export_failed", message: "sandbox unreachable" });
 
     expect(runCommitExporterFor({
-      executionTarget: { kind: "remote", transport: "ssh" } as never, nativeWorkspaceSync: null, hostWorkspaceDir: root,
+      runId: randomUUID(), executionTarget: { kind: "remote", transport: "ssh" } as never, nativeWorkspaceSync: null, hostWorkspaceDir: root,
     })).toBeNull();
     await expect(exportRunCommits(randomUUID())).rejects.toMatchObject({ code: "workspace_not_exportable" });
     await expect(stat(path.join(root, ".git"))).rejects.toMatchObject({ code: "ENOENT" });

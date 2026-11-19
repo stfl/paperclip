@@ -148,7 +148,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       input.workspace.nativeWorkspaceSync = { mode: "host_current", reference: {
         schema: "paperclip.native-workspace-sync/v3", state: "prepared", descriptorSha256: "a".repeat(64), baselineSha256: "b".repeat(64), finalHostSha256: null,
         workspaceId: run.id, leaseId: randomUUID(), providerLeaseId: "controlled-local", remoteCwd: home, resourceDisposition: null },
-        restoreWorkspace: vi.fn(async () => {}), cleanup: vi.fn(async () => {}) };
+        restoreWorkspace: vi.fn(async () => {}), exportCommits: vi.fn(), releaseCommitExport: vi.fn(async () => {}), cleanup: vi.fn(async () => {}) };
       const diagnosticExpected = ["current", "stopped", "unknown-code", "permission", "io", "diagnostic-sink-failed"].includes(scenario);
       let faultInjected = false, lockHeld = false, settledWhileLocked = false;
       let releaseLock: () => void = () => {};

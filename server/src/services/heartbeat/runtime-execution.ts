@@ -523,6 +523,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
     context.goalControlRequestId,
   );
   const releaseCommitExport = registerRunCommitExport(run.id, runCommitExporterFor({
+    runId: run.id,
     executionTarget,
     nativeWorkspaceSync,
     hostWorkspaceDir: executionWorkspace.cwd,
