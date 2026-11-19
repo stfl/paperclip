@@ -31,7 +31,7 @@ import {
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
-import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, recordedProcessStopAuthority } from "./remote-execution-termination.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { alias } from "drizzle-orm/pg-core";
 
@@ -129,9 +129,15 @@ export async function validateExecutionReconciliation(input: {
       throw conflict("The retained workspace environment has not confirmed that it stopped. Wait for cleanup before recording workspace repair.");
     }
     checkLocalProcesses = leases.some(lease => lease.provider === "local");
+  } else if (run.processPid || run.processGroupId) {
+    const authority = await recordedProcessStopAuthority(db, run);
+    if (authority === "provider_unconfirmed") {
+      throw conflict("The previous execution environment has not confirmed that it stopped. Wait for cleanup before continuing.");
+    }
+    checkLocalProcesses = authority === "host";
   }
-  // A retained remote source's PIDs belong to its sandbox, not this server.
-  // Its exact lease receipts above replace host-local process probes.
+  // A provider environment's PIDs belong to that environment, not this server.
+  // Its lease receipts replace host-local process probes.
   for (const pid of checkLocalProcesses ? [
     run.processPid,
     run.processGroupId ? -run.processGroupId : null,
