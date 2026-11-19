@@ -225,6 +225,25 @@ describeEmbeddedPostgres("a card's wake for its addressee agent", () => {
     });
   });
 
+  // The card names this issue, but belongs to another company: only the
+  // company filter tells it apart.
+  it("cancels the addressee's run when a card on the same issue id belongs to another company", async () => {
+    const f = await seedCard();
+    const other = await seedCard();
+    const interactionId = await insertCard({
+      companyId: other.companyId,
+      issueId: f.issueId,
+      createdByAgentId: other.assignee,
+      addresseeAgentId: f.addressee,
+    });
+    const runId = await queueCardWake({ ...f, interactionId }, f.addressee);
+
+    expect(await staleness(f, runId)).toMatchObject({
+      outcome: "cancelled",
+      errorCode: "issue_assignee_changed",
+    });
+  });
+
   // Agents trading cards on one issue: `earlier` agent cards before the one
   // the wake names, all later than any human turn.
   async function seedTradedCards(earlier: number) {
@@ -256,6 +275,49 @@ describeEmbeddedPostgres("a card's wake for its addressee agent", () => {
       errorCode: "issue_assignee_changed",
     });
   });
+
+  it("admits the addressee's run while the cards agents traded stay within the cap", async () => {
+    const f = await seedTradedCards(9);
+    const runId = await queueCardWake(f, f.addressee);
+
+    expect(await staleness(f, runId)).toMatchObject({ outcome: "not_stale" });
+  });
+
+  // The same trade with the database's own timestamps, which keep
+  // microseconds: the woken card is created last.
+  async function seedTradedCardsAtDbTime(earlier: number) {
+    const f = await seedCard();
+    await db.delete(issueThreadInteractions).where(eq(issueThreadInteractions.id, f.interactionId));
+    for (let i = 0; i < earlier; i += 1) {
+      await insertCard({
+        companyId: f.companyId,
+        issueId: f.issueId,
+        status: "answered",
+        createdByAgentId: i % 2 === 0 ? f.assignee : f.addressee,
+        addresseeAgentId: i % 2 === 0 ? f.addressee : f.assignee,
+      });
+    }
+    const interactionId = await insertCard({
+      companyId: f.companyId,
+      issueId: f.issueId,
+      createdByAgentId: f.assignee,
+      addresseeAgentId: f.addressee,
+    });
+    return { ...f, interactionId };
+  }
+
+  it.each([
+    [9, "not_stale"],
+    [10, "cancelled"],
+  ] as const)(
+    "with database timestamps, %i earlier traded cards leave the addressee's run %s",
+    async (earlier, outcome) => {
+      const f = await seedTradedCardsAtDbTime(earlier);
+      const runId = await queueCardWake(f, f.addressee);
+
+      expect(await staleness(f, runId)).toMatchObject({ outcome });
+    },
+  );
 
   it("admits the addressee's run again after a human comments on the issue", async () => {
     const f = await seedTradedCards(10);
