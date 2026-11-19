@@ -98,7 +98,8 @@ export function reserveSystemRecoveryAttempt(state: SystemRecoveryState, now = D
   // Starting another call is not evidence that the prior call failed.
   if (state.state === "running" && state.attemptId) return { ...state, revision: state.revision + 1 };
   if ((state.deadlineAt !== null && now >= state.deadlineAt) ||
-      (state.attempts > 0 && state.retriesUsed >= SYSTEM_RECOVERY_MAX_RETRIES)) return null;
+      (state.attempts > 0 && state.retriesUsed >= SYSTEM_RECOVERY_MAX_RETRIES &&
+        state.failure?.code !== "workspace_writer_active")) return null;
   return { ...state, revision: state.revision + 1, state: "running", attemptId: randomUUID(),
     attempts: state.attempts + 1, nextAttemptAt: null,
     retriesUsed: state.retriesUsed + (state.attempts > 0 && state.failure?.code !== "workspace_writer_active" ? 1 : 0) };
