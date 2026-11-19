@@ -15,6 +15,8 @@ export interface AgentLifecycleOperation {
   /** The controller process holding the lease; restart recovery settles it once proven gone. */
   leaseHolder?: { bootId: string; pid: number; hostHash: string; processStartedAt: string | null };
   retryAt?: string;
+  /** What a step has long been waiting for. The step is still retried; this is not a failure. */
+  wait?: string;
   /** Healthy host verification awaits a durable external producer, not a retry timer. */
   waitingForSignal?: boolean;
   /** A committed recheck raced an active host attempt; its defer must not park it. */

@@ -1,13 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { companies, createDb, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { agents, companies, createDb, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { logger } from "../middleware/logger.js";
-import { agentExecutionStopHold, agentExecutionsHaveStopped, noteAgentExecutionStopHold,
+import { AGENT_EXECUTION_STOP_HOLD_CLAUSES, agentExecutionStopHold, agentExecutionsHaveStopped, noteAgentExecutionStopHold,
   rememberedAgentExecutionStopHolds } from "./agent-execution-stop.js";
+import { agentService } from "./agents.js";
 import { readProcessStartedAt } from "./hot-restart.js";
-import { createAgentLifecycle } from "./agent-lifecycle.js";
+import { configureAgentLifecycle, createAgentLifecycle } from "./agent-lifecycle.js";
+import { lifecycleWaitMessage } from "../modules/agent-lifecycle/application/failure.js";
+import type { LifecycleHostResult } from "../modules/agent-lifecycle/application/ports.js";
+import { isLifecycleWaitOverdue } from "../modules/agent-lifecycle/domain/policy.js";
 
 // Above any pid the kernel hands out, so only the probe below answers for them.
 const RECORDED_PID = 2_000_000_101;
@@ -18,15 +22,21 @@ const support = await getEmbeddedPostgresTestSupport();
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: Db;
   let companyId: string;
+  const workers: ReturnType<typeof configureAgentLifecycle>[] = [];
   beforeAll(async () => { database = await startEmbeddedPostgresTestDatabase("paperclip-agent-stop-holds-"); db = createDb(database.connectionString); }, 90_000);
-  afterAll(async () => { await db?.$client.end({ timeout: 0 }); await database?.cleanup(); });
+  afterAll(async () => {
+    for (const worker of workers) await worker.stop();
+    await db?.$client.end({ timeout: 0 }); await database?.cleanup();
+  });
   beforeEach(async () => {
+    for (const worker of workers) await worker.stop();
     companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Stop holds", issuePrefix: `S${companyId.slice(0, 7)}` });
   });
   afterEach(() => vi.restoreAllMocks());
 
   async function hire() { return createAgentLifecycle(db).requestHire(companyId, { name: "Agent", status: "idle", adapterType: "process" }); }
+  async function current(id: string) { return (await db.select().from(agents).where(eq(agents.id, id)))[0]!; }
   /** A cancelled native run whose expired finalization owner recorded `controller` as its pid. */
   async function abandonedFinalization(agentId: string, controller: Partial<typeof nativeRunFinalizations.$inferInsert>) {
     const at = new Date("2026-01-01T00:00:00.000Z");
@@ -97,6 +107,45 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
       .where(eq(environmentLeases.id, lease!.id));
     expect(await agentExecutionStopHold(db, [agent.id])).toEqual({ clause: "remote_stop_unconfirmed", runId: run.id, agentId: agent.id });
+  });
+
+  it("shows why a pause keeps waiting, retries at the slower pace, and clears the wait once it completes", async () => {
+    let host: LifecycleHostResult = { pending: "process_alive" };
+    const worker = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => host });
+    workers.push(worker);
+    const agent = await hire();
+    await createAgentLifecycle(db).pauseAgent(agent.id);
+    await worker.process(agent.id);
+    const young = await current(agent.id);
+    expect(young).toMatchObject({ lifecycleState: "pausing", lifecycleError: null });
+    expect(Date.parse(young.lifecycleOperation!.retryAt!) - Date.now()).toBeLessThan(10_000);
+
+    let attempts = 1;
+    while (!isLifecycleWaitOverdue(attempts + 1)) attempts++;
+    const due = () => db.update(agents).set({ lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt'
+      || jsonb_build_object('attempts', ${attempts}::integer)` }).where(eq(agents.id, agent.id));
+    await due();
+    await worker.process(agent.id);
+    const overdue = await current(agent.id);
+    // A wait is not a failure: the agent carries it apart from lifecycleError.
+    expect(overdue).toMatchObject({ lifecycleState: "pausing", lifecycleError: null });
+    expect(overdue.lifecycleOperation!.wait).toContain("Stopping agent execution is still waiting");
+    expect(overdue.lifecycleOperation!.wait).toContain("(process_alive)");
+    expect(overdue.lifecycleOperation).toMatchObject({ hostComplete: false });
+    expect((await agentService(db).getById(agent.id))!.lifecycleWait).toBe(overdue.lifecycleOperation!.wait);
+    expect(Date.parse(overdue.lifecycleOperation!.retryAt!) - Date.now()).toBeGreaterThan(30_000);
+
+    host = "complete";
+    await due();
+    await worker.process(agent.id);
+    expect(await current(agent.id)).toMatchObject({ lifecycleState: "paused", lifecycleError: null });
+    expect((await agentService(db).getById(agent.id))!.lifecycleWait).toBeNull();
+  });
+
+  it("has a message for every check a stop can wait on", () => {
+    for (const clause of AGENT_EXECUTION_STOP_HOLD_CLAUSES) {
+      expect(lifecycleWaitMessage({ stage: "host", phase: "pausing" }, clause)).toContain(`(${clause})`);
+    }
   });
 
   it("forgets the hold of a stop that is no longer checked", () => {

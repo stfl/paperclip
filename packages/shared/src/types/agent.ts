@@ -102,6 +102,8 @@ export interface Agent {
   lifecycleState?: AgentLifecycleState;
   lifecycleVersion?: number;
   lifecycleError?: string | null;
+  /** What a pending lifecycle step has long been waiting for. Not a failure. */
+  lifecycleWait?: string | null;
   reportsTo: string | null;
   capabilities: string | null;
   adapterType: AgentAdapterType;

@@ -20,14 +20,20 @@ export interface LifecycleStore {
   setRequiredPlugins(agent: LifecycleAgent, owner: string, pluginIds: string[]): Promise<boolean>;
   completeHost(agent: LifecycleAgent, owner: string): Promise<boolean>;
   completePlugin(agent: LifecycleAgent, owner: string, pluginId: string): Promise<boolean>;
-  defer(agent: LifecycleAgent, owner: string, error: string | null, now: Date, options?: { retryRequired?: boolean; verificationFailures?: number; waitForSignal?: boolean }): Promise<boolean>;
+  /** `wait` is what a step has long been waiting for. It is not a failure: the
+   * agent shows no error while the step is still retried. */
+  defer(agent: LifecycleAgent, owner: string, error: string | null, now: Date, options?: { retryRequired?: boolean; verificationFailures?: number; waitForSignal?: boolean; wait?: string }): Promise<boolean>;
   pending(limit: number, now: Date): Promise<string[]>;
 }
 
+/** waiting is only a healthy verifying phase owned by an external event. A host
+ * step that waits on something it can name reports that key as `{ pending }`,
+ * so a long wait becomes visible on the agent. */
+export type LifecycleHostResult = "complete" | "pending" | "waiting" | { pending: string };
+
 export interface LifecycleDriver {
   requiredPluginIds(agent: LifecycleAgent): Promise<string[]>;
-  /** waiting is only a healthy verifying phase owned by an external event. */
-  runHost(agent: LifecycleAgent): Promise<"complete" | "pending" | "waiting">;
+  runHost(agent: LifecycleAgent): Promise<LifecycleHostResult>;
   runPlugin(agent: LifecycleAgent, pluginId: string): Promise<"complete" | "pending">;
   /** Notify the scheduler only after readiness has committed. */
   onReady?(agent: LifecycleAgent): Promise<void>;

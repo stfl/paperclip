@@ -241,7 +241,7 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
     },
     async completeHost(agent, owner) {
       const rows = await db.update(agents).set({
-        lifecycleOperation: sql`jsonb_set(${agents.lifecycleOperation}, '{hostComplete}', 'true'::jsonb)`,
+        lifecycleOperation: sql`jsonb_set(${agents.lifecycleOperation} - 'wait', '{hostComplete}', 'true'::jsonb)`,
       }).where(and(eq(agents.id, agent.id), eq(agents.lifecycleVersion, agent.lifecycleVersion),
         sql`${agents.lifecycleOperation}->>'leaseOwner' = ${owner}`)).returning({ id: agents.id });
       return rows.length > 0;
@@ -258,7 +258,7 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
     async defer(agent, owner, error, now, options) {
       if (options?.waitForSignal && agent.lifecycleState === "verifying") {
         const rows = await db.update(agents).set({ lifecycleError: null,
-          lifecycleOperation: sql`(${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt' - 'waitingForSignal' - 'recheckRequested')
+          lifecycleOperation: sql`(${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt' - 'waitingForSignal' - 'recheckRequested' - 'wait')
             || case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true'
               then '{}'::jsonb else '{"waitingForSignal":true}'::jsonb end`,
           updatedAt: now,
@@ -268,13 +268,14 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
       }
       const retry: Partial<AgentLifecycleOperation> = options?.retryRequired && agent.lifecycleState === "verifying"
         ? { retryRequired: true }
-        : { retryAt: new Date(now.getTime() + (error ? 60_000 : 2_000)).toISOString() };
+        : { retryAt: new Date(now.getTime() + (error || options?.wait ? 60_000 : 2_000)).toISOString() };
       if (options?.verificationFailures !== undefined && agent.lifecycleState === "verifying") {
         retry.verificationFailures = options.verificationFailures;
       }
+      if (options?.wait) retry.wait = options.wait;
       const rows = await db.update(agents).set({
         lifecycleError: error,
-        lifecycleOperation: sql`(${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt' - 'retryRequired' - 'waitingForSignal' - 'recheckRequested')
+        lifecycleOperation: sql`(${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt' - 'retryRequired' - 'waitingForSignal' - 'recheckRequested' - 'wait')
           || ${JSON.stringify(retry)}::jsonb`,
         updatedAt: now,
       }).where(and(eq(agents.id, agent.id), eq(agents.lifecycleVersion, agent.lifecycleVersion),
