@@ -33,7 +33,10 @@ describeEmbeddedPostgres("stranded todo sweep and other agents' parked wakes", (
     await tempDb.cleanup();
   });
 
-  async function seedHandoff(parkedWakeOwner: "previous" | "assignee") {
+  async function seedHandoff(
+    parkedWakeOwner: "previous" | "assignee",
+    status: "todo" | "in_progress" = "todo",
+  ) {
     const companyId = randomUUID();
     const previousAgentId = randomUUID();
     const assigneeAgentId = randomUUID();
@@ -59,7 +62,7 @@ describeEmbeddedPostgres("stranded todo sweep and other agents' parked wakes", (
       id: issueId,
       companyId,
       title: "Review the pull request",
-      status: "todo",
+      status,
       assigneeAgentId,
       createdAt: new Date(Date.now() - 60 * 60 * 1000),
       updatedAt: new Date(Date.now() - 60 * 60 * 1000),
@@ -190,6 +193,42 @@ describeEmbeddedPostgres("stranded todo sweep and other agents' parked wakes", (
 
     expect(enqueueWakeup).not.toHaveBeenCalled();
     expect(result.dispatchRequeued).toBe(0);
+    expect(result.issueIds).not.toContain(f.issueId);
+  });
+
+  it("wakes the assignee of an in_progress issue once when only a previous assignee's parked wake remains", async () => {
+    const f = await seedHandoff("previous", "in_progress");
+    const enqueueWakeup = vi.fn().mockImplementation(async (agentId: string) => {
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId: f.companyId,
+        agentId,
+        issueId: f.issueId,
+        status: "queued",
+        contextSnapshot: { issueId: f.issueId, wakeReason: "issue_continuation_needed" },
+      }).returning();
+      return run;
+    });
+
+    const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ escalated: 0, issueIds: [f.issueId] });
+    expect(enqueueWakeup).toHaveBeenCalledOnce();
+    expect(enqueueWakeup).toHaveBeenCalledWith(f.assigneeAgentId, expect.anything());
+    const parked = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, f.previousAgentId));
+    expect(parked).toHaveLength(1);
+    expect(parked[0]).toMatchObject({ status: "deferred_issue_execution", runId: null });
+  });
+
+  it("leaves an in_progress issue alone while the assignee's own parked wake is live", async () => {
+    const f = await seedHandoff("assignee", "in_progress");
+    const enqueueWakeup = vi.fn();
+
+    const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+
+    expect(enqueueWakeup).not.toHaveBeenCalled();
     expect(result.issueIds).not.toContain(f.issueId);
   });
 });
