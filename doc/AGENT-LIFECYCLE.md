@@ -292,6 +292,20 @@ periodic agent heartbeats to be enabled.
 A cancelled run record does not prove that execution stopped.
 The host also checks process ownership, controller leases, and environment cleanup.
 Required plugin cleanup cannot start while these checks are incomplete.
+The host starts every run process and every finalization controller as its
+own user. When the host is not permitted to signal a recorded process
+identifier of a finished run or of a finalization controller, the process
+start time decides. The recorded start time means the process is alive. Another start time, or a process that the host cannot see, means the
+identifier belongs to an unrelated process. A visible process with no
+recorded start time to compare keeps the check waiting. Windows is the
+exception: there a denied probe proves nothing and the check keeps waiting.
+A run in a provider environment records that environment's process
+identifiers. The host does not look them up in its own process table. The
+provider's termination receipt proves that such a run stopped.
+The host logs the check that a stop waits for. When the wait is long, the
+agent shows that check in `lifecycleWait`, and the worker retries at the pace
+of a failed step until the check passes. A wait is not a failure:
+`lifecycleError` stays empty.
 
 The worker starts after a committed command.
 A periodic scan recovers work after a process stops.
@@ -300,7 +314,7 @@ The worker renews that lease during external calls.
 Each result must match the current revision and lease owner.
 Shutdown waits for active work.
 
-The agent API returns `lifecycleState`, `lifecycleVersion`, and `lifecycleError`.
+The agent API returns `lifecycleState`, `lifecycleVersion`, `lifecycleError`, and `lifecycleWait`.
 A board user can retry through `POST /api/agents/:id/lifecycle/retry`.
 The route applies the existing company access checks.
 

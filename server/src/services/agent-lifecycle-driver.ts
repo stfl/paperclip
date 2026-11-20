@@ -79,8 +79,9 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
             inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
             sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? 'pauseStop')`));
         }
-        if (!await heartbeat.stopInvocationsForAgents(ids, reason,
-          { preservePauseDeferred: agent.lifecycleState === "pausing" })) return "pending";
+        const hold = await heartbeat.stopHoldForAgents(ids, reason,
+          { preservePauseDeferred: agent.lifecycleState === "pausing" });
+        if (hold) return { pending: hold.clause };
       }
       return "complete";
     },

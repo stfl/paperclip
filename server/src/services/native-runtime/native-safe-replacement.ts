@@ -26,7 +26,7 @@ import { issueService } from "../issues.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { buildExecutionContinuation } from "../execution-continuation.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
-import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, recordedProcessStopAuthority } from "../remote-execution-termination.js";
 import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES } from "./native-retired-backup-source.js";
 import { completedWorkspaceRecoveryCondition } from "../workspace-recovery-receipt.js";
 import { nativeRunHasNoWorkspaceAccess } from "../workspace-restore-recovery-state.js";
@@ -45,6 +45,19 @@ const processAlive = (pid: number | null) => {
     return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
 };
+
+/** A provider environment's process identifiers name nothing in this host's
+ * process table: its termination receipts prove the stop instead. */
+async function providerProcessStopped(
+  db: Db,
+  run: typeof heartbeatRuns.$inferSelect,
+  leases: Array<typeof environmentLeases.$inferSelect>,
+): Promise<boolean> {
+  if (run.processPid === null && run.processGroupId === null) return true;
+  const authority = await recordedProcessStopAuthority(db, run, leases);
+  if (authority !== "host") return authority === "provider_stopped";
+  return !processAlive(run.processPid) && !processAlive(run.processGroupId ? -run.processGroupId : null);
+}
 
 type ReplacementDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -503,8 +516,7 @@ export async function reconcileSafeNativeReplacements(
         predecessorFenced:
           coordinator.leaseOwner === null && run.status === "failed",
         providerStopped:
-          !processAlive(run.processPid) &&
-          !processAlive(run.processGroupId ? -run.processGroupId : null) &&
+          await providerProcessStopped(db, run, leases) &&
           (remoteWorkspace?.providerStopped ?? true),
         workspacePreserved: noWorkspaceToSave || (remoteWorkspace ? remoteWorkspace.workspacePreserved :
           typeof workspace.cwd === "string" &&

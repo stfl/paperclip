@@ -67,7 +67,7 @@ import {
   formatIssueIdentifierLink,
 } from "./heartbeat/scheduling.js";
 import { canApplyTaskWorkspaceSelectionAtAdmission, taskWorkspaceRuntimeSelectionEnabled } from "./execution-workspace-policy.js";
-import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
+import { agentExecutionStopHold, noteAgentExecutionStopHold, type AgentExecutionStopHold } from "./agent-execution-stop.js";
 import {
   cancelHeartbeatNativeRun,
   terminateHeartbeatRunProcess,
@@ -4174,8 +4174,15 @@ export function heartbeatService(
   }
 
   async function stopInvocationsForAgents(agentIds: string[], reason: string, options: StopInvocationOptions = {}) {
+    return !await stopHoldForAgents(agentIds, reason, options);
+  }
+
+  async function stopHoldForAgents(agentIds: string[], reason: string,
+    options: StopInvocationOptions = {}): Promise<AgentExecutionStopHold | null> {
     await cancelInvocationsForAgentsInternal(agentIds, reason, options);
-    const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
+    // A stable order names the same hold on every check while several last.
+    const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds))
+      .orderBy(heartbeatRuns.createdAt, heartbeatRuns.id);
     const leasesToRelease = await db.select({ runId: environmentLeases.heartbeatRunId }).from(environmentLeases)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
       .where(and(inArray(heartbeatRuns.agentId, agentIds),
@@ -4185,18 +4192,21 @@ export function heartbeatService(
     for (const run of runs) {
       if (!isHeartbeatRunTerminalStatus(run.status) || liveRunExecutions.has(run.id) ||
           adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id) ||
-          (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())) return false;
+          (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())) {
+        return noteAgentExecutionStopHold(agentIds, { clause: "run_active", runId: run.id, agentId: run.agentId });
+      }
       if (needsRelease.has(run.id)) {
         // Retry incomplete cleanup after a run becomes terminal.
         await releaseEnvironmentLeasesForRun({ runId: run.id, companyId: run.companyId,
           agentId: run.agentId, status: run.status, providerResourceDisposition: "destroy" });
       }
     }
-    return agentExecutionsHaveStopped(db, agentIds);
+    return agentExecutionStopHold(db, agentIds);
   }
 
   return {
     stopInvocationsForAgents,
+    stopHoldForAgents,
     waitForRunExecutionDrain: async (
       runId: string,
       options: { timeoutMs?: number; intervalMs?: number } = {},
