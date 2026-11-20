@@ -1,7 +1,9 @@
 import type { NativeEvidenceAssessment } from "./evidence-classifier.js";
 import { NATIVE_MODEL_REJECTION_MESSAGE, NATIVE_PROVIDER_CAPACITY_MAX_RETRIES, NATIVE_PROVIDER_OVERLOADED_CODE, NATIVE_PROVIDER_OVERLOADED_MESSAGE } from "./native-provider-failure.js";
 
-export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v13";
+export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v14";
+
+export const NATIVE_RESPONSE_WAKE_WAITING_REASON = "response_wake_waiting_for_input";
 
 export type NativeAuthoritativeIssueStatus =
   | "backlog"
@@ -658,6 +660,20 @@ export function arbitrateNativeStatus(input: {
       unblockDescriptor: null,
       // An answered native plan is not task completion or permission to
       // change modes. Only a new explicit user cause may continue the work.
+      effects: [],
+    };
+  }
+  if (
+    input.assessment.reportedDisposition === "yielded" &&
+    input.assessment.continuation?.kind === "response_wake" &&
+    !unfinishedResponseWait
+  ) {
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "in_progress",
+      toStatus: "in_progress",
+      reasonCode: NATIVE_RESPONSE_WAKE_WAITING_REASON,
+      unblockDescriptor: null,
       effects: [],
     };
   }
