@@ -50,6 +50,27 @@ function connectorRepositoryTool(args) {
   if (program !== 'gh' || args[0] !== 'repo' || args.includes('--help') || args.includes('-h')) return null;
   return connectorRepositoryTools.get(args[1]) || null;
 }
+const identityKeys = ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'];
+const isIdentityKey = (key) => /^user\.(name|email)$/i.test(key);
+function moveIdentityToGlobalConfig(env, configDirectory) {
+  const entries = Array.from({ length: Number(env.GIT_CONFIG_COUNT) || 0 }, (_, i) => [env['GIT_CONFIG_KEY_' + i], env['GIT_CONFIG_VALUE_' + i]])
+    .filter(([key, value]) => typeof key === 'string' && typeof value === 'string');
+  const user = { name: env.GIT_AUTHOR_NAME, email: env.GIT_AUTHOR_EMAIL };
+  for (const [key, value] of entries) if (isIdentityKey(key)) user[key.slice(5).toLowerCase()] = value;
+  const values = Object.entries(user).filter(([, value]) => value);
+  if (!values.length || values.some(([, value]) => /[\0\r\n]/.test(value))) return;
+  const file = path.join(configDirectory, 'gitconfig');
+  const quote = (value) => '"' + value.replace(/[\\"]/g, c => '\\' + c) + '"';
+  try {
+    fs.writeFileSync(file, '[user]\n' + values.map(([key, value]) => '\t' + key + ' = ' + quote(value) + '\n').join(''), { mode: 0o600 });
+  } catch { return; }
+  for (const key of identityKeys) delete env[key];
+  for (const key of Object.keys(env)) if (/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(key)) delete env[key];
+  const kept = entries.filter(([key]) => !isIdentityKey(key));
+  kept.forEach(([key, value], i) => { env['GIT_CONFIG_KEY_' + i] = key; env['GIT_CONFIG_VALUE_' + i] = value; });
+  env.GIT_CONFIG_COUNT = String(kept.length);
+  env.GIT_CONFIG_GLOBAL = file;
+}
 async function main() {
   let env = { ...process.env };
 ${options.brokerFile ? String.raw`
@@ -157,6 +178,7 @@ ${options.brokerFile ? String.raw`
     process.exitCode = 1;
     return;
   }
+  if (program === 'git' && configReady) moveIdentityToGlobalConfig(env, configDirectory);
   // Only this invocation and its children inherit the captured credential.
   env.PAPERCLIP_GITHUB_OPERATION_ACTIVE = '1';
   // Its Git children use the real binary, so steering cannot split a gh operation.
