@@ -34,7 +34,10 @@ line in your report and stop.
 ## Port the conflicting branch
 
 `build-next` printed `branch=`, `issue=`, `old_base=`, `old_tip=` and
-`new_base=`; `old_base` is where the branch leaves upstream `master`.
+`new_base=`; `old_base` is where the branch leaves upstream `master`, and
+`new_base` is the newest commit of the release that upstream `master` has: the
+release itself, or for one cut from a side branch the commit it left `master`
+at.
 
 1. `routine.sh port-begin <branch>` rebases it onto its new base in the build
    worktree. A branch stacked on another (its issue's `Depends on`) goes onto

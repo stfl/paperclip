@@ -35,7 +35,7 @@ usage: routine.sh [--dry-run] <command> [args]
 
   setup                     fetch, resolve the release, read the open issues
   plan                      print what sync and build-next would do
-  sync                      fast-forward master; close or label issues by PR state
+  sync                      move master to the release; close or label issues by PR state
   build-next                merge every open branch onto master (exit 3: conflict,
                             exit 10: nothing to do)
   port-begin <branch>       start rebasing a conflicting branch onto its new base
@@ -195,6 +195,12 @@ old_tip_of() { # the tip origin had before this run ported it
 
 is_ancestor() { G merge-base --is-ancestor "$1" "$2" 2>/dev/null; }
 
+# The newest stable release tag upstream put on a commit; empty for none.
+release_tag_of() { G tag --list 'v*' --points-at "$1" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1; }
+
+# Whether release tag $2 is a newer version than release tag $1.
+is_newer_release() { [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1) == "$2" ]]; }
+
 # Where a branch leaves upstream master.
 real_base_of() { G merge-base "$1" refs/remotes/upstream/master; }
 
@@ -244,7 +250,7 @@ cmd_setup() {
 	: >"$STATE_DIR/summary"
 	: >"$STATE_DIR/closed"
 	: >"$STATE_DIR/ported"
-	local up release rel cur move
+	local up release rel cur cur_release move
 	if [[ -d $META_DIR/rr-cache ]]; then
 		mkdir -p "$GIT_COMMON/rr-cache"
 		cp -a "$META_DIR/rr-cache/." "$GIT_COMMON/rr-cache/"
@@ -268,17 +274,17 @@ cmd_setup() {
 	[[ $release == v* ]] || die "latest release of $UPSTREAM_SLUG has tag '$release'"
 	G rev-parse --verify -q "refs/tags/$release^{commit}" >/dev/null || die "upstream has no tag $release"
 	rel=$(G rev-parse "refs/tags/$release^{commit}")
-	if ! is_ancestor "$rel" refs/remotes/upstream/master; then
-		record "STOP: release $release (${rel:0:12}) is not on upstream master: release from a side branch, ask Stefan"
-		exit "$EXIT_STOP"
-	fi
 	cur=$(G rev-parse refs/remotes/origin/master)
 	if [[ $cur == "$rel" ]]; then
 		move=none
 	elif is_ancestor "$cur" "$rel"; then
 		move=fast-forward
+	elif cur_release=$(release_tag_of "$cur") && [[ -n $cur_release ]] && is_newer_release "$cur_release" "$release"; then
+		# The next release does not contain one cut from a side branch:
+		# master moves from one released commit to the next.
+		move=reset
 	else
-		record "STOP: origin/master ${cur:0:12} is not an ancestor of release $release (${rel:0:12}), ask Stefan"
+		record "STOP: origin/master ${cur:0:12} is neither an ancestor of release $release (${rel:0:12}) nor an older release, ask Stefan"
 		exit "$EXIT_STOP"
 	fi
 	printf 'RELEASE=%q\nMASTER=%q\nOLD_MASTER=%q\nMASTER_MOVE=%q\n' "$release" "$rel" "$cur" "$move" >"$STATE_DIR/release"
@@ -329,9 +335,9 @@ decide_issue() { # <number> <labels> <pr>
 
 cmd_sync() {
 	need_state
-	if [[ $MASTER_MOVE == fast-forward ]]; then
-		push_ref "$MASTER" master - || die "master was not fast-forwarded"
-		record "master: fast-forwarded ${OLD_MASTER:0:12} -> ${MASTER:0:12} ($RELEASE)$(dry && printf ' (dry run)')"
+	if [[ $MASTER_MOVE != none ]]; then
+		push_ref "$MASTER" master "$OLD_MASTER" || die "master was not moved"
+		record "master: $MASTER_MOVE ${OLD_MASTER:0:12} -> ${MASTER:0:12} ($RELEASE)$(dry && printf ' (dry run)')"
 	else
 		record "master: already at $RELEASE (${MASTER:0:12})"
 	fi
@@ -411,13 +417,19 @@ ensure_build_worktree() {
 	B clean -fdq
 }
 
-# The base a branch is rebased onto: master, or the branch it is stacked on.
+# The newest commit of master that upstream master has: master itself, or,
+# for a release cut from a side branch, the commit that branch left master at.
+# A branch ported onto it carries none of the release-only commits, so an
+# upstream PR from it shows only the branch's own.
+master_base() { G merge-base "$MASTER" refs/remotes/upstream/master; }
+
+# The base a branch is rebased onto: master_base, or the branch it is stacked on.
 new_base_of() {
 	local n deps
 	n=$(issue_of_branch "$1")
 	deps=$(issue_field "$n" 5)
 	if [[ $deps == - ]]; then
-		printf '%s\n' "$MASTER"
+		master_base
 	else
 		[[ $deps != *,* ]] || log "warning: $1 depends on several branches ($deps): using the first"
 		tip_of "${deps%%,*}"
@@ -588,7 +600,7 @@ cmd_port_report() {
 	f=$(mktemp)
 	{
 		printf 'Ported `%s` onto %s for %s: `%s` -> `%s`.\n\n' "$b" \
-			"$([[ $new_base == "$MASTER" ]] && printf '`master`' || printf 'the ported branch it depends on')" \
+			"$([[ $new_base == "$(master_base)" ]] && printf '`master`' || printf 'the ported branch it depends on')" \
 			"$RELEASE" "${old_tip:0:12}" "${new_tip:0:12}"
 		printf '`git range-diff %s..%s %s..%s`\n\n' "${old_base:0:12}" "${old_tip:0:12}" "${new_base:0:12}" "${new_tip:0:12}"
 		printf '````text\n%s\n````\n' "$diff"
@@ -659,7 +671,8 @@ cmd_save_rerere() {
 cmd_plan() {
 	need_state
 	local n labels branch pr deps out decision a base closing=()
-	printf 'release: %s (%s), on upstream master\n' "$RELEASE" "$MASTER"
+	printf 'release: %s (%s), %s\n' "$RELEASE" "$MASTER" \
+		"$(is_ancestor "$MASTER" refs/remotes/upstream/master && printf 'on upstream master' || printf 'cut from a side branch of upstream master')"
 	printf 'master: %s at %s, %s\n' "$FORK" "${OLD_MASTER:0:12}" "$MASTER_MOVE"
 	printf 'issues:\n'
 	while IFS=$'\t' read -r n labels branch pr deps; do
