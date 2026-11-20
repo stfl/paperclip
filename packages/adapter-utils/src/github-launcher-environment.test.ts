@@ -125,6 +125,38 @@ describe("managed GitHub launcher environment", () => {
     }
   });
 
+  it("keeps a PATH the run extended in nested bash and restores the staged PATH in a login bash", async () => {
+    const fixture = await sandbox("usr/bin", true);
+    const env = await prepareGitHubOperationLaunchers({
+      runId: "nested-bash-path", target: fixture.target, cwd: fixture.root,
+      env: githubBrokerEnvironment({ PATH: fixture.remotePath }, { url: "", token: "" }),
+    });
+    const staged = `${env.PAPERCLIP_GITHUB_LAUNCHER_DIR}:${fixture.remotePath}`;
+    const printPath = `printf %s "$PATH"`;
+    // Wrapper scripts such as Nix's cargo and rustc are bash and read BASH_ENV
+    // again; a tool the run put on PATH must still be found by what they start.
+    const nested = await fixture.runner.execute({
+      command: "bash",
+      args: ["--noprofile", "--norc", "-c", `PATH="$PATH:/run/extra/bin"; bash --noprofile --norc -c '${printPath}'`],
+      env,
+    });
+    expect(nested.exitCode, nested.stderr).toBe(0);
+    expect(nested.stdout).toBe(`${staged}:/run/extra/bin`);
+    // A login shell's profile files may replace PATH, as /etc/profile does on
+    // NixOS; BASH_ENV is read after them and puts the staged PATH back.
+    await writeFile(path.join(fixture.root, ".bash_profile"), "export PATH=/replaced/by/profile\n");
+    const login = await fixture.runner.execute({ command: "bash", args: ["-lc", printPath], env });
+    expect(login.exitCode, login.stderr).toBe(0);
+    expect(login.stdout).toBe(staged);
+    const loginNested = await fixture.runner.execute({
+      command: "bash",
+      args: ["-lc", `PATH="$PATH:/run/extra/bin"; bash -c '${printPath}'`],
+      env,
+    });
+    expect(loginNested.exitCode, loginNested.stderr).toBe(0);
+    expect(loginNested.stdout).toBe(`${staged}:/run/extra/bin`);
+  });
+
   it("settles failed upload batches before rejecting and starting no later files", async () => {
     const fixture = await sandbox("usr/bin", true);
     let release!: () => void;
