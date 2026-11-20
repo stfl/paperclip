@@ -150,6 +150,12 @@ export type QueuedRunFacts = {
   /** A connection resolution or tool refresh can resume an agent waiting in review. */
   isConnectionContinuation?: boolean;
   isInteractionWake: boolean;
+  /**
+   * The run's agent executes on the Paperclip Runner. The Runner reads and
+   * changes a task only for its assignee or current reviewer, so it cannot
+   * deliver a comment to an agent that holds neither role.
+   */
+  agentRunsOnRunner?: boolean;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
 
@@ -577,7 +583,7 @@ export function decideQueuedRunStaleness(
     runAgentId: facts.runAgentId,
     issueAssigneeAgentId: facts.issueAssigneeAgentId,
     isNonAssigneeWorkspaceBusyRetry: facts.isNonAssigneeWorkspaceBusyRetry,
-    isInteractionWake: facts.isInteractionWake,
+    isInteractionWake: facts.isInteractionWake && facts.agentRunsOnRunner !== true,
     isCurrentReviewParticipant:
       facts.reviewParticipant.isInReview &&
       facts.reviewParticipant.participantIsAgent &&

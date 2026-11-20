@@ -445,6 +445,49 @@ describe("decideQueuedRunStaleness", () => {
     expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
   });
 
+  describe("a comment wake whose task changed hands before the claim", () => {
+    const handedOver = (): QueuedRunFacts => ({
+      ...baseStalenessFacts(),
+      issueAssigneeAgentId: null,
+      issueExecutionRunId: null,
+      isInteractionWake: true,
+      wakeCommentIdPresent: true,
+      wakeReason: "issue_commented",
+    });
+
+    it("still reaches a direct-adapter agent", () => {
+      expect(decideQueuedRunStaleness(handedOver(), NOW)).toEqual({ stale: false });
+      expect(decideQueuedRunStaleness({ ...handedOver(), agentRunsOnRunner: false }, NOW)).toEqual({ stale: false });
+    });
+
+    it("is cancelled for a Runner agent, which can no longer read or change the task", () => {
+      expect(decideQueuedRunStaleness({ ...handedOver(), agentRunsOnRunner: true }, NOW)).toMatchObject({
+        stale: true,
+        errorCode: "issue_assignee_changed",
+        details: { issueId: "issue-1", previousAssigneeAgentId: "agent-1", currentAssigneeAgentId: null },
+      });
+    });
+
+    it("keeps a Runner agent's comment wake while it is the assignee or the current reviewer", () => {
+      expect(decideQueuedRunStaleness({ ...handedOver(), agentRunsOnRunner: true, issueAssigneeAgentId: "agent-1" }, NOW))
+        .toEqual({ stale: false });
+      expect(decideQueuedRunStaleness({
+        ...handedOver(),
+        agentRunsOnRunner: true,
+        issueAssigneeAgentId: "implementor",
+        issueStatus: "in_review",
+        reviewParticipant: {
+          isInReview: true,
+          hasParticipant: true,
+          participantIsAgent: true,
+          participantAgentId: "agent-1",
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: "agent-1" },
+        },
+      }, NOW)).toEqual({ stale: false });
+    });
+  });
+
   it("allows resume intent to bypass a terminal status", () => {
     const facts: QueuedRunFacts = {
       ...baseStalenessFacts(),

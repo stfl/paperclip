@@ -664,6 +664,11 @@ export function createPostgresRunDispatchAdapter(
       context,
       ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
     );
+    const agentRunsOnRunner = await dbOrTx
+      .select({ adapterType: agents.adapterType })
+      .from(agents)
+      .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)))
+      .then((rows) => rows[0]?.adapterType === "paperclip_runner");
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
     // A card addressed to an agent wakes that agent whether or not it holds
@@ -763,6 +768,7 @@ export function createPostgresRunDispatchAdapter(
     return {
       runId: input.runId,
       runAgentId: input.agentId,
+      agentRunsOnRunner,
       issueId,
       retryReasonKind,
       dependenciesBlocked: readiness && !readiness.isDependencyReady ? {
@@ -1245,6 +1251,13 @@ export function createPostgresRunDispatchAdapter(
               : {}),
             ...(decision.errorCode === "execution_reconciliation_required"
               ? { executionWait: decision.details }
+              : {}),
+            // A queued run that never started did no provider work. Without
+            // this evidence its cancellation counts as an unreconciled
+            // execution and holds the new owner's waiting wake.
+            ...(decision.errorCode === "issue_assignee_changed" && expectedStatus === "queued" &&
+                run.runtimeMode !== "native" && !run.startedAt && !run.processPid
+              ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }
               : {}),
             effectiveTimeoutSec: 0,
             timeoutConfigured: false,
