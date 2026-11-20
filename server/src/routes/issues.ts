@@ -198,7 +198,12 @@ import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { isUniqueViolation } from "../db-errors.js";
 import type { StorageService } from "../storage/types.js";
-import { validate, validateIssueMutationBody } from "../middleware/validate.js";
+import {
+  rejectUnknownIssueFields,
+  rejectUnknownQueryParameters,
+  validate,
+  validateIssueMutationBody,
+} from "../middleware/validate.js";
 import * as serviceIndex from "../services/index.js";
 import { conversationDecisionReceiptsService } from "../services/conversation-decision-receipts.js";
 import {
@@ -435,6 +440,61 @@ function queuedCommentAuthorOnlyDenial(issue: { identifier?: string | null }) {
     + `Tell the author to discard it there.`;
 }
 
+// Keys an issue update has always dropped and still accepts: GitHub Sync's own
+// PATCHes carry them, and refusing them would send it to a direct write that
+// skips the route's wakes and policy handling.
+const UPDATE_ISSUE_TOLERATED_FIELDS = ["executionState", "originKind", "originId"] as const;
+// The public child create has always dropped an idempotency key, and the
+// paperclip skill tells agents to send one with every issue create.
+const CREATE_CHILD_ISSUE_TOLERATED_FIELDS = ["idempotencyKey"] as const;
+// List parameters the handler ignores and still accepts: the issue list
+// route's own tests send `projection`, the name of the UI's view filter.
+const ISSUE_LIST_TOLERATED_QUERY_PARAMETERS = ["projection"] as const;
+// Every query parameter the company issue list handler reads. The route
+// refuses any other, so a lookup such as `?identifier=` cannot return the
+// unfiltered list; the route test fails when the handler reads another set.
+export const ISSUE_LIST_QUERY_PARAMETERS: ReadonlySet<string> = new Set([
+  "afterId",
+  "assigneeAgentId",
+  "assigneeUserId",
+  "attention",
+  "createdFromIssueId",
+  "descendantOf",
+  "displayStatus",
+  "excludeRoutineExecutions",
+  "executionWorkspaceId",
+  "hasPlanDocument",
+  "ids",
+  "inboxArchivedByUserId",
+  "includeAgentCreatedTasks",
+  "includeBlockedBy",
+  "includeBlockedInboxAttention",
+  "includeLiveDescendantSummary",
+  "includeParticipatedTasks",
+  "includePluginOperations",
+  "includeRoutineExecutions",
+  "labelId",
+  "limit",
+  "offset",
+  "oneChildPerParent",
+  "originId",
+  "originKind",
+  "originKindPrefix",
+  "parentId",
+  "parentIds",
+  "parentIssueId",
+  "participantAgentId",
+  "projectId",
+  "q",
+  "sortDir",
+  "sortField",
+  "status",
+  "touchedByUserId",
+  "unreadForUserId",
+  "updatedSince",
+  "view",
+  "workspaceId",
+]);
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),
@@ -3272,7 +3332,7 @@ function decrementIssueListActorClientInflight(actorClientKey: string) {
   else issueListActorClientInflight.set(actorClientKey, next);
 }
 
-const ISSUE_LIST_UUID_QUERY_PARAMS = [
+export const ISSUE_LIST_UUID_QUERY_PARAMS = [
   "participantAgentId",
   "projectId",
   "workspaceId",
@@ -8751,7 +8811,7 @@ export function issueRoutes(
     res.json(coordinated.response.body);
   });
 
-  router.get("/companies/:companyId/issues", async (req, res) => {
+  router.get("/companies/:companyId/issues", rejectUnknownQueryParameters(new Set([...ISSUE_LIST_QUERY_PARAMETERS, ...ISSUE_LIST_TOLERATED_QUERY_PARAMETERS])), async (req, res) => {
     const startedAt = Date.now();
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -12817,6 +12877,7 @@ export function issueRoutes(
   router.post(
     "/companies/:companyId/issues",
     applyCreateIssueStatusDefault,
+    rejectUnknownIssueFields(createIssueSchema),
     validateIssueMutationBody(createIssueSchema),
     async (req, res) => {
       const companyId = req.params.companyId as string;
@@ -13395,6 +13456,7 @@ export function issueRoutes(
   router.post(
     "/issues/:id/children",
     applyCreateIssueStatusDefault,
+    rejectUnknownIssueFields(createChildIssueSchema, CREATE_CHILD_ISSUE_TOLERATED_FIELDS),
     validateIssueMutationBody(createChildIssueSchema),
     async (req, res) => {
       const parentId = req.params.id as string;
@@ -13686,6 +13748,7 @@ export function issueRoutes(
 
   router.post(
     "/issues/:id/accepted-plan-decompositions",
+    rejectUnknownIssueFields(createAcceptedPlanDecompositionSchema),
     validateIssueMutationBody(createAcceptedPlanDecompositionSchema),
     async (req, res) => {
       const sourceIssueId = req.params.id as string;
@@ -14380,6 +14443,7 @@ export function issueRoutes(
       }
       next();
     },
+    rejectUnknownIssueFields(updateIssueRouteSchema, UPDATE_ISSUE_TOLERATED_FIELDS),
     validateIssueMutationBody(updateIssueRouteSchema),
     async (req, res) => {
       // Snapshot-guarded writes are policy-only. Do not admit task-control
