@@ -355,6 +355,32 @@ export function createGitRemoteAuthProvider(
   };
 }
 
+export const AGENT_GITHUB_TOKEN_CONFIG_PATH = "access.GH_TOKEN";
+
+export function agentGitHubTokenBinding(
+  adapterConfig: unknown,
+): { secretId: string; version: number | "latest" } | null {
+  const binding = adapterConfig && typeof adapterConfig === "object"
+    ? (adapterConfig as Record<string, unknown>)[AGENT_GITHUB_TOKEN_CONFIG_PATH]
+    : null;
+  if (!binding || typeof binding !== "object") return null;
+  const { type, secretId, version } = binding as Record<string, unknown>;
+  if (type !== "secret_ref" || typeof secretId !== "string" || !secretId) return null;
+  return {
+    secretId,
+    version: typeof version === "number" && Number.isInteger(version) && version > 0 ? version : "latest",
+  };
+}
+
+export function withAgentGitHubTokenSelection<T extends { configured: boolean }>(
+  selection: T,
+  run: { driver: string | null | undefined; adapterConfig: unknown },
+): T | { configured: true } {
+  if (selection.configured) return selection;
+  if (["local", "ssh"].includes(run.driver ?? "local")) return selection;
+  return agentGitHubTokenBinding(run.adapterConfig) ? { configured: true } : selection;
+}
+
 export async function resolveManagedGitHubIdentitySelection(
   db: Db,
   companyId: string,
